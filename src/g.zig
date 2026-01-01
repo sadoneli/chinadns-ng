@@ -90,3 +90,8 @@ pub var cert_verify: bool = false;
 
 /// the location of CA certs
 pub var ca_certs: DynStr = .{};
+
+/// proxy for trust upstream dns (socks5://ip:port)
+pub var proxy_server: ?cc.ConstStr = null;
+pub var proxy_addr: ?cc.SockAddr = null;
+pub var proxy_group_mask: u16 = 0; // bitset: 1 << Tag.int()

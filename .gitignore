@@ -3,6 +3,7 @@
 zig-out/
 zig-cache/
 .zig-cache/
+dist/
 dep/openssl-*
 dep/mimalloc-*
 dep/wolfssl-*

@@ -16,6 +16,7 @@ const co = @import("co.zig");
 const groups = @import("groups.zig");
 const cache = @import("cache.zig");
 const verdict_cache = @import("verdict_cache.zig");
+const Tag = @import("tag.zig").Tag;
 const assert = std.debug.assert;
 
 // ============================================================================
@@ -179,6 +180,34 @@ pub fn main() u8 {
     }
 
     log.info(src, "default domain name tag: %s", .{g.default_tag.name()});
+
+    if (g.proxy_server) |proxy| {
+        var buf: [128:0]u8 = undefined;
+        var n: usize = 0;
+
+        var tag_v: u8 = 0; // make zls 0.12 happy
+        while (tag_v <= c.TAG_NONE) : (tag_v += 1) {
+            const tag = Tag.from_int(tag_v);
+            if (!tag.valid() or tag == .none or tag.is_null())
+                continue;
+            if (tag_v >= 16)
+                continue;
+            if ((g.proxy_group_mask & (@as(u16, 1) << @intCast(u4, tag_v))) == 0)
+                continue;
+
+            const name = cc.strslice_c(tag.name());
+            if (n > 0 and n + 1 < buf.len) {
+                buf[n] = ',';
+                n += 1;
+            }
+            const need = std.math.min(name.len, buf.len - 1 - n);
+            @memcpy(buf[n .. n + need].ptr, name.ptr, need);
+            n += need;
+        }
+        buf[n] = 0;
+
+        log.info(src, "proxy server: %s (groups:%s)", .{ proxy, &buf });
+    }
 
     if (g.cache_size > 0) {
         log.info(src, "enable dns cache, capacity: %u", .{cc.to_uint(g.cache_size)});

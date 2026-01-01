@@ -51,6 +51,8 @@ const help =
     \\ --dns-rr-ip <names>=<ips>            define local resource records of type A/AAAA
     \\ --cert-verify                        enable SSL certificate validation, default: no
     \\ --ca-certs <path>                    CA certs path for SSL certificate validation
+    \\ --proxy-server <url>                 socks5 proxy for trust upstream dns (no auth)
+    \\ --proxy-group <tags>                 tag list to use proxy, default: gfw
     \\ --no-ipset-blacklist                 add-ip: don't enable built-in ip blacklist
     \\                                      blacklist: 127.0.0.0/8, 0.0.0.0/8, ::1, ::
     \\ -o, --timeout-sec <sec>              response timeout of upstream, default: 5
@@ -148,6 +150,8 @@ const optdef_array = [_]OptDef{
     .{ .short = "",  .long = "dns-rr-ip",          .value = .required, .optfn = opt_dns_rr_ip,          },
     .{ .short = "",  .long = "cert-verify",        .value = .no_value, .optfn = opt_cert_verify,        },
     .{ .short = "",  .long = "ca-certs",           .value = .required, .optfn = opt_ca_certs,           },
+    .{ .short = "",  .long = "proxy-server",       .value = .required, .optfn = opt_proxy_server,       },
+    .{ .short = "",  .long = "proxy-group",        .value = .required, .optfn = opt_proxy_group,        },
     .{ .short = "",  .long = "no-ipset-blacklist", .value = .no_value, .optfn = opt_no_ipset_blacklist, },
     .{ .short = "o", .long = "timeout-sec",        .value = .required, .optfn = opt_timeout_sec,        },
     .{ .short = "p", .long = "repeat-times",       .value = .required, .optfn = opt_repeat_times,       },
@@ -537,6 +541,84 @@ fn opt_cert_verify(_: ?[]const u8) void {
 
 fn opt_ca_certs(in_value: ?[]const u8) void {
     g.ca_certs.set(in_value.?);
+}
+
+fn opt_proxy_server(in_value: ?[]const u8) void {
+    const value = in_value.?;
+    const src = @src();
+
+    const prefix = "socks5://";
+    if (!std.mem.startsWith(u8, value, prefix))
+        invalid_optvalue(src, value);
+
+    const rest = value[prefix.len..];
+    if (rest.len == 0)
+        invalid_optvalue(src, value);
+
+    var ip: []const u8 = "";
+    var port_str: []const u8 = "";
+
+    if (rest[0] == '[') {
+        const rb = std.mem.indexOfScalar(u8, rest, ']') orelse invalid_optvalue(src, value);
+        ip = rest[1..rb];
+        if (rb + 1 >= rest.len)
+            invalid_optvalue(src, value);
+        const sep = rest[rb + 1];
+        if (sep != ':' and sep != '#')
+            invalid_optvalue(src, value);
+        port_str = rest[rb + 2 ..];
+    } else {
+        const sep_pos = std.mem.lastIndexOfAny(u8, rest, ":#") orelse invalid_optvalue(src, value);
+        ip = rest[0..sep_pos];
+        port_str = rest[sep_pos + 1 ..];
+    }
+
+    if (ip.len == 0 or port_str.len == 0)
+        invalid_optvalue(src, value);
+
+    check_ip(ip) orelse invalid_optvalue(src, value);
+    const port = check_port(port_str) orelse invalid_optvalue(src, value);
+
+    g.proxy_addr = cc.SockAddr.from_text(cc.to_cstr(ip), port);
+    g.proxy_server = (g.allocator.dupeZ(u8, value) catch unreachable).ptr;
+
+    // keep backward compatibility: proxy trust group by default
+    if (g.proxy_group_mask == 0)
+        g.proxy_group_mask = (@as(u16, 1) << @intCast(u4, Tag.gfw.int()));
+}
+
+fn opt_proxy_group(in_value: ?[]const u8) void {
+    const src = @src();
+    const value = in_value.?;
+
+    var mask: u16 = 0;
+
+    var it = std.mem.split(u8, value, ",");
+    while (it.next()) |raw_name| {
+        const name = std.mem.trim(u8, raw_name, " \t\r");
+        if (name.len == 0)
+            invalid_optvalue(src, value);
+
+        const tag = Tag.from_name(cc.to_cstr(name)) orelse b: {
+            var overflow: bool = undefined;
+            break :b Tag.register(cc.to_cstr(name), &overflow) orelse invalid_optvalue(src, value);
+        };
+
+        if (tag == .none or tag.is_null())
+            invalid_optvalue(src, value);
+
+        const tag_int = tag.int();
+        if (tag_int >= 16)
+            invalid_optvalue(src, value);
+
+        mask |= (@as(u16, 1) << @intCast(u4, tag_int));
+    }
+
+    if (mask == 0)
+        invalid_optvalue(src, value);
+
+    // overwrite mode: last one wins
+    g.proxy_group_mask = mask;
 }
 
 fn opt_no_ipset_blacklist(_: ?[]const u8) void {

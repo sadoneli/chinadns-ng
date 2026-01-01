@@ -373,6 +373,14 @@ pub inline fn connect(fd: c_int, addr: *const SockAddr) ?void {
     return if (raw.connect(fd, addr, addr.len()) == -1) null;
 }
 
+pub inline fn getsockname(fd: c_int, addr: *SockAddr) ?void {
+    const raw = struct {
+        extern fn getsockname(fd: c_int, addr: *anyopaque, addrlen: *c.socklen_t) c_int;
+    };
+    var addrlen: c.socklen_t = @sizeOf(SockAddr);
+    return if (raw.getsockname(fd, addr, &addrlen) == -1) null;
+}
+
 pub inline fn accept4(fd: c_int, addr: ?*SockAddr, flags: c_int) ?c_int {
     const raw = struct {
         extern fn accept4(fd: c_int, addr: ?*anyopaque, addrlen: ?*c.socklen_t, flags: c_int) c_int;

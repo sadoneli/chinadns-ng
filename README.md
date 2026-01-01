@@ -587,6 +587,19 @@ group-upstream 192.168.1.1
   - wolfssl 在某些平台（arm32、mips）可能无法正确验证 SSL 证书，见 [#169](https://github.com/zfl9/chinadns-ng/issues/169)。
 - `ca-certs` CA 根证书路径，用于验证 DoT 上游的 SSL 证书。默认自动检测。
 
+### proxy-server
+
+- `proxy-server` 为指定组（默认 `gfw`）的“对上游 DNS 的请求”指定 SOCKS5 代理（无鉴权）。
+  - 格式：`socks5://<ip>:<port>`（IPv6 需使用 `socks5://[<ip>]:<port>`）。
+  - 对 `udp://` 上游：使用 SOCKS5 `UDP ASSOCIATE` 转发 UDP DNS。
+  - 对 `tcp://`、`tls://(DoT)` 上游：使用 SOCKS5 `CONNECT` 转发 TCP/DoT。
+
+### proxy-group
+
+- `proxy-group` 指定哪些域名组(tag)的上游请求需要走 `proxy-server`。
+  - 例：`proxy-group gfw,us,uk`，表示 gfw/us/uk 三个组都走代理。
+  - 默认值为 `gfw`（兼容旧行为：只代理 trust 组）。
+
 ### no-ipset-blacklist
 
 - `no-ipset-blacklist` 若指定此选项，则 add-ip 时不进行内置的 IP 过滤。

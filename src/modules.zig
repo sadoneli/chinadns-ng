@@ -1,5 +1,5 @@
-pub const name_list = .{ "CacheMsg", "DynStr", "EvLoop", "Node", "Rc", "RcMsg", "StrList", "Upstream", "c", "cache", "cache_ignore", "cc", "co", "dnl", "dns", "fmtchk", "g", "groups", "ip6_filter", "ipset", "local_rr", "log", "main", "modules", "net", "opt", "sentinel_vector", "server", "str2int", "tag", "tests", "verdict_cache" };
-pub const module_list = .{ CacheMsg, DynStr, EvLoop, Node, Rc, RcMsg, StrList, Upstream, c, cache, cache_ignore, cc, co, dnl, dns, fmtchk, g, groups, ip6_filter, ipset, local_rr, log, main, modules, net, opt, sentinel_vector, server, str2int, tag, tests, verdict_cache };
+pub const name_list = .{ "CacheMsg", "DynStr", "EvLoop", "Node", "Rc", "RcMsg", "StrList", "Upstream", "c", "cache", "cache_ignore", "cc", "co", "dnl", "dns", "fmtchk", "g", "groups", "ip6_filter", "ipset", "local_rr", "log", "main", "modules", "net", "opt", "sentinel_vector", "server", "socks5", "str2int", "tag", "tests", "verdict_cache" };
+pub const module_list = .{ CacheMsg, DynStr, EvLoop, Node, Rc, RcMsg, StrList, Upstream, c, cache, cache_ignore, cc, co, dnl, dns, fmtchk, g, groups, ip6_filter, ipset, local_rr, log, main, modules, net, opt, sentinel_vector, server, socks5, str2int, tag, tests, verdict_cache };
 
 const CacheMsg = @import("CacheMsg.zig");
 const DynStr = @import("DynStr.zig");
@@ -29,6 +29,7 @@ const net = @import("net.zig");
 const opt = @import("opt.zig");
 const sentinel_vector = @import("sentinel_vector.zig");
 const server = @import("server.zig");
+const socks5 = @import("socks5.zig");
 const str2int = @import("str2int.zig");
 const tag = @import("tag.zig");
 const tests = @import("tests.zig");

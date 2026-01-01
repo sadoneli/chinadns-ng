@@ -14,7 +14,19 @@ const EvLoop = @import("EvLoop.zig");
 const RcMsg = @import("RcMsg.zig");
 const Node = @import("Node.zig");
 const str2int = @import("str2int.zig");
+const socks5 = @import("socks5.zig");
 const assert = std.debug.assert;
+
+fn use_proxy(upstream: *const Upstream) bool {
+    if (g.proxy_addr == null)
+        return false;
+    if (g.proxy_group_mask == 0)
+        return false;
+    const tag_int = upstream.tag.int();
+    if (tag_int >= 16)
+        return false;
+    return (g.proxy_group_mask & (@as(u16, 1) << @intCast(u4, tag_int))) != 0;
+}
 
 // ======================================================
 
@@ -204,20 +216,36 @@ const UDP = struct {
     session_node: SessionNode = .{ .type = .udp }, // _session_list node
     upstream: *Upstream,
     fdobj: *EvLoop.Fd,
+    proxy_fdobj: ?*EvLoop.Fd = null, // socks5 tcp control channel (UDP ASSOCIATE)
     query_list: std.AutoHashMapUnmanaged(u16, void) = .{}, // outstanding queries (qid)
     create_time: u64,
     query_time: u64 = undefined, // last query time
     query_count: u16 = 0, // total query count
     freed: bool = false,
+    proxy_enabled: bool = false,
+    proxy_ready: bool = false,
+    proxy_starting: bool = false,
+    proxy_pending: std.ArrayListUnmanaged(*RcMsg) = .{},
+    proxy_relay: cc.SockAddr = undefined, // udp relay addr from proxy
+    proxy_prefix: [socks5.UDP_OVERHEAD_MAX]u8 = undefined, // socks5 udp request header prefix
+    proxy_prefix_len: u8 = 0,
 
     pub fn new(upstream: *Upstream) ?*UDP {
-        const fd = net.new_sock(upstream.addr.family(), .udp) orelse return null;
         const self = g.allocator.create(UDP) catch unreachable;
-        self.* = .{
-            .upstream = upstream,
-            .fdobj = EvLoop.Fd.new(fd),
-            .create_time = g.evloop.time,
-        };
+        self.* = .{ .upstream = upstream, .fdobj = undefined, .create_time = g.evloop.time };
+
+        errdefer g.allocator.destroy(self);
+
+        self.proxy_enabled = use_proxy(upstream);
+
+        const family = if (self.proxy_enabled)
+            g.proxy_addr.?.family()
+        else
+            upstream.addr.family();
+
+        const fd = net.new_sock(family, .udp) orelse return null;
+        self.fdobj = EvLoop.Fd.new(fd);
+
         return self;
     }
 
@@ -228,6 +256,10 @@ const UDP = struct {
         if (self.freed) return;
         self.freed = true;
 
+        for (self.proxy_pending.items) |qmsg|
+            qmsg.unref();
+        self.proxy_pending.clearAndFree(g.allocator);
+
         if (!self.is_idle())
             self.session_node.on_idle();
 
@@ -236,6 +268,11 @@ const UDP = struct {
 
         self.fdobj.cancel();
         self.fdobj.free();
+
+        if (self.proxy_fdobj) |pfdobj| {
+            pfdobj.cancel();
+            pfdobj.free();
+        }
 
         self.query_list.clearAndFree(g.allocator);
 
@@ -262,22 +299,51 @@ const UDP = struct {
             return;
         }
 
+        if (self.proxy_enabled and !self.proxy_ready) {
+            // async socks5 udp associate + relay setup
+            self.proxy_pending.append(g.allocator, qmsg.ref()) catch unreachable;
+            if (!self.proxy_starting) {
+                self.proxy_starting = true;
+                co.start(proxy_init, .{self});
+            }
+            return;
+        }
+
+        self.send_query_now(qmsg);
+    }
+
+    fn send_query_now(self: *UDP, qmsg: *RcMsg) void {
+        assert(!self.proxy_enabled or self.proxy_ready);
+
         if (self.upstream.tag == .gfw and g.trustdns_packet_n > 1) {
             var iov = [_]cc.iovec_t{
-                .{
+                .{ .iov_base = qmsg.msg().ptr, .iov_len = qmsg.len },
+                undefined, // proxy header (optional)
+            };
+
+            const msg_iov = if (self.proxy_enabled) b: {
+                // keep header first
+                iov[0] = .{
+                    .iov_base = @ptrCast([*]u8, &self.proxy_prefix[0]),
+                    .iov_len = cc.to_usize(self.proxy_prefix_len),
+                };
+                iov[1] = .{
                     .iov_base = qmsg.msg().ptr,
                     .iov_len = qmsg.len,
-                },
-            };
+                };
+                break :b iov[0..2];
+            } else iov[0..1];
 
             var msgv: [g.TRUSTDNS_PACKET_MAX]cc.mmsghdr_t = undefined;
 
+            const dst = if (self.proxy_enabled) &self.proxy_relay else &self.upstream.addr;
+
             msgv[0] = .{
                 .msg_hdr = .{
-                    .msg_name = &self.upstream.addr,
-                    .msg_namelen = self.upstream.addr.len(),
-                    .msg_iov = &iov,
-                    .msg_iovlen = iov.len,
+                    .msg_name = dst,
+                    .msg_namelen = dst.len(),
+                    .msg_iov = msg_iov.ptr,
+                    .msg_iovlen = msg_iov.len,
                 },
             };
 
@@ -288,7 +354,21 @@ const UDP = struct {
 
             _ = cc.sendmmsg(self.fdobj.fd, &msgv, 0) orelse self.on_error("send");
         } else {
-            _ = cc.sendto(self.fdobj.fd, qmsg.msg(), 0, &self.upstream.addr) orelse self.on_error("send");
+            if (self.proxy_enabled) {
+                var iov = [_]cc.iovec_t{
+                    .{ .iov_base = @ptrCast([*]u8, &self.proxy_prefix[0]), .iov_len = cc.to_usize(self.proxy_prefix_len) },
+                    .{ .iov_base = qmsg.msg().ptr, .iov_len = qmsg.len },
+                };
+                const msghdr = cc.msghdr_t{
+                    .msg_name = &self.proxy_relay,
+                    .msg_namelen = self.proxy_relay.len(),
+                    .msg_iov = &iov,
+                    .msg_iovlen = iov.len,
+                };
+                _ = cc.sendmsg(self.fdobj.fd, &msghdr, 0) orelse self.on_error("send");
+            } else {
+                _ = cc.sendto(self.fdobj.fd, qmsg.msg(), 0, &self.upstream.addr) orelse self.on_error("send");
+            }
         }
 
         self.session_node.on_work(self.is_idle());
@@ -300,6 +380,102 @@ const UDP = struct {
         // start recv coroutine, must be at the end
         if (self.query_count == 1)
             co.start(reply_receiver, .{self}); // may call self.free()
+    }
+
+    fn proxy_init(self: *UDP) void {
+        defer co.terminate(@frame(), @frameSize(proxy_init));
+
+        defer self.proxy_starting = false;
+
+        if (!self.proxy_enabled)
+            return;
+
+        const proxy_addr = g.proxy_addr orelse return;
+
+        const proxy: cc.ConstStr = g.proxy_server orelse @ptrCast(cc.ConstStr, cc.to_cstr("(proxy)"));
+
+        const drop_pending = struct {
+            fn f(self_: *UDP) void {
+                for (self_.proxy_pending.items) |qmsg|
+                    qmsg.unref();
+                self_.proxy_pending.clearAndFree(g.allocator);
+            }
+        }.f;
+
+        const tcp_fd = net.new_tcp_conn_sock(proxy_addr.family()) orelse return;
+        const pfdobj = EvLoop.Fd.new(tcp_fd);
+
+        var ok = false;
+        defer if (!ok) {
+            pfdobj.cancel();
+            pfdobj.free();
+        };
+
+        g.evloop.connect(pfdobj, &proxy_addr) orelse {
+            log.warn(@src(), "connect(%s) failed: (%d) %m", .{ proxy, cc.errno() });
+            drop_pending(self);
+            return;
+        };
+
+        if (socks5.greet_noauth(pfdobj)) |err| {
+            log.warn(@src(), "connect(%s) failed: %s", .{ proxy, err });
+            drop_pending(self);
+            return;
+        }
+
+        // bind local udp port and tell proxy our udp endpoint (some servers require this)
+        var tcp_local: cc.SockAddr = undefined;
+        if (cc.getsockname(pfdobj.fd, &tcp_local) == null) {
+            log.warn(@src(), "getsockname(%s) failed: (%d) %m", .{ proxy, cc.errno() });
+            drop_pending(self);
+            return;
+        }
+
+        var udp_bind = tcp_local;
+        if (udp_bind.is_sin())
+            udp_bind.sin.sin_port = 0
+        else
+            udp_bind.sin6.sin6_port = 0;
+
+        if (cc.bind(self.fdobj.fd, &udp_bind) == null) {
+            log.warn(@src(), "bind(udp for %s) failed: (%d) %m", .{ proxy, cc.errno() });
+            drop_pending(self);
+            return;
+        }
+
+        var udp_local: cc.SockAddr = undefined;
+        if (cc.getsockname(self.fdobj.fd, &udp_local) == null) {
+            log.warn(@src(), "getsockname(udp for %s) failed: (%d) %m", .{ proxy, cc.errno() });
+            drop_pending(self);
+            return;
+        }
+
+        if (socks5.request_udp_associate(pfdobj, &proxy_addr, &udp_local, &self.proxy_relay)) |err| {
+            log.warn(@src(), "connect(%s) failed: %s", .{ proxy, err });
+            drop_pending(self);
+            return;
+        }
+
+        const n = socks5.build_udp_datagram_prefix(&self.proxy_prefix, &self.upstream.addr) orelse return;
+        self.proxy_prefix_len = cc.to_u8(n);
+
+        self.proxy_fdobj = pfdobj;
+        self.proxy_ready = true;
+        ok = true;
+
+        if (g.verbose()) {
+            var ip: cc.IpStrBuf = undefined;
+            var port: u16 = undefined;
+            self.proxy_relay.to_text(&ip, &port);
+            log.info(@src(), "socks5 udp relay: %s#%u", .{ &ip, cc.to_uint(port) });
+        }
+
+        // flush pending queries
+        for (self.proxy_pending.items) |qmsg| {
+            nosuspend self.send_query_now(qmsg);
+            qmsg.unref();
+        }
+        self.proxy_pending.clearAndFree(g.allocator);
     }
 
     /// no outstanding queries
@@ -332,7 +508,12 @@ const UDP = struct {
         defer if (free_rmsg) |rmsg| rmsg.free();
 
         while (true) {
-            const rmsg = free_rmsg orelse RcMsg.new(c.DNS_EDNS_MAXSIZE);
+            const cap: u16 = if (self.proxy_enabled)
+                cc.to_u16(c.DNS_EDNS_MAXSIZE + socks5.UDP_OVERHEAD_MAX)
+            else
+                c.DNS_EDNS_MAXSIZE;
+
+            const rmsg = free_rmsg orelse RcMsg.new(cap);
             free_rmsg = null;
 
             defer {
@@ -342,7 +523,11 @@ const UDP = struct {
                     rmsg.unref();
             }
 
-            const len = g.evloop.read_udp(self.fdobj, rmsg.buf(), null) orelse return self.on_error("recv");
+            const raw_len = g.evloop.read_udp(self.fdobj, rmsg.buf(), null) orelse return self.on_error("recv");
+            const len: usize = if (self.proxy_enabled)
+                (socks5.decode_udp_datagram_inplace(rmsg.buf(), raw_len) orelse continue)
+            else
+                raw_len;
             rmsg.len = cc.to_u16(len);
 
             const prev_idle = self.is_idle();
@@ -749,7 +934,11 @@ const TCP = struct {
 
         defer self.stop();
 
-        const fd = net.new_tcp_conn_sock(self.upstream.addr.family()) orelse return;
+        const family = if (use_proxy(self.upstream))
+            g.proxy_addr.?.family()
+        else
+            self.upstream.addr.family();
+        const fd = net.new_tcp_conn_sock(family) orelse return;
         self.fdobj = EvLoop.Fd.new(fd);
 
         self.connect() orelse return;
@@ -843,7 +1032,18 @@ const TCP = struct {
         // null means strerror(errno)
         const errmsg: ?cc.ConstStr = e: {
             const fdobj = self.fdobj.?;
-            g.evloop.connect(fdobj, &self.upstream.addr) orelse break :e null;
+            if (use_proxy(self.upstream)) {
+                const proxy_addr = g.proxy_addr.?;
+                g.evloop.connect(fdobj, &proxy_addr) orelse break :e null;
+
+                if (socks5.greet_noauth(fdobj)) |err|
+                    break :e err;
+
+                if (socks5.request_connect(fdobj, &self.upstream.addr)) |err|
+                    break :e err;
+            } else {
+                g.evloop.connect(fdobj, &self.upstream.addr) orelse break :e null;
+            }
 
             if (has_tls and self.upstream.proto == .tls) {
                 self.tls.new_ssl(fdobj.fd, self.upstream.host) orelse break :e "unable to create ssl object";
