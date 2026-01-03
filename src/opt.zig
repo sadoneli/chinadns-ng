@@ -19,8 +19,8 @@ const help =
     \\ -l, --bind-port <port[@proto]>       listen port number, default: 65353
     \\ -c, --china-dns <upstreams>          china dns server, default: <114 DNS>
     \\ -t, --trust-dns <upstreams>          trust dns server, default: <Google DNS>
-    \\ -m, --chnlist-file <paths>           path(s) of chnlist, '-' indicate stdin
-    \\ -g, --gfwlist-file <paths>           path(s) of gfwlist, '-' indicate stdin
+    \\ -m, --chnlist-file <paths>           path(s) of chnlist, '-' indicate stdin, support .gz
+    \\ -g, --gfwlist-file <paths>           path(s) of gfwlist, '-' indicate stdin, support .gz
     \\ -M, --chnlist-first                  match chnlist first, default gfwlist first
     \\ -d, --default-tag <tag>              chn or gfw or <user-tag> or none(default)
     \\ -a, --add-tagchn-ip [set4,set6]      add the ip of name-tag:chn to ipset/nftset
@@ -31,7 +31,7 @@ const help =
     \\                                      if setname contains @, then use nftset
     \\                                      format: family_name@table_name@set_name
     \\ --group <name>                       define rule group: {dnl, upstream, ipset}
-    \\ --group-dnl <paths>                  domain name list for the current group
+    \\ --group-dnl <paths>                  domain name list for the current group, support .gz
     \\ --group-upstream <upstreams>         upstream dns server for the current group
     \\ --group-ipset <set4,set6>            add the ip of the current group to ipset
     \\ -N, --no-ipv6 [rules]                tag:<name>[@ip:*], ip:china, ip:non_china

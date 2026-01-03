@@ -314,8 +314,8 @@ usage: chinadns-ng <options...>. the existing options are as follows:
  -l, --bind-port <port[@proto]>       listen port number, default: 65353
  -c, --china-dns <upstreams>          china dns server, default: <114 DNS>
  -t, --trust-dns <upstreams>          trust dns server, default: <Google DNS>
- -m, --chnlist-file <paths>           path(s) of chnlist, '-' indicate stdin
- -g, --gfwlist-file <paths>           path(s) of gfwlist, '-' indicate stdin
+ -m, --chnlist-file <paths>           path(s) of chnlist, '-' indicate stdin, support .gz
+ -g, --gfwlist-file <paths>           path(s) of gfwlist, '-' indicate stdin, support .gz
  -M, --chnlist-first                  match chnlist first, default gfwlist first
  -d, --default-tag <tag>              chn or gfw or <user-tag> or none(default)
  -a, --add-tagchn-ip [set4,set6]      add the ip of name-tag:chn to ipset/nftset
@@ -326,7 +326,7 @@ usage: chinadns-ng <options...>. the existing options are as follows:
                                       if setname contains @, then use nftset
                                       format: family_name@table_name@set_name
  --group <name>                       define rule group: {dnl, upstream, ipset}
- --group-dnl <paths>                  domain name list for the current group
+ --group-dnl <paths>                  domain name list for the current group, support .gz
  --group-upstream <upstreams>         upstream dns server for the current group
  --group-ipset <set4,set6>            add the ip of the current group to ipset
  -N, --no-ipv6 [rules]                tag:<name>[@ip:*], ip:china, ip:non_china
@@ -419,6 +419,7 @@ bug report: https://github.com/zfl9/chinadns-ng. email: zfl9.com@gmail.com (Otok
 
 - `chnlist-file` 白名单 [域名列表文件](#域名列表)，命中的域名只走国内 DNS。
 - `gfwlist-file` 黑名单 [域名列表文件](#域名列表)，命中的域名只走可信 DNS。
+  - 支持 gzip 压缩文件（`.gz`）。
   - 2023.04.01 版本起，可指定多个路径，逗号隔开，如 `-g a.txt,b.txt`。
   - 2024.03.07 版本起，可多次指定 `chnlist-file`、`gfwlist-file` 选项。
 - `chnlist-first` 选项表示优先加载 chnlist，默认是优先加载 gfwlist。
@@ -488,7 +489,7 @@ nftset 相关说明：
   - 用例 2：将 公司域名 划分出来，单独一个组，用公司内网专用的 DNS 去解析。
   - 2024.04.27 版本起，使用 `null` 作为 group 名时，表示过滤该组的域名查询。
     - null 组只有 `group-dnl` 信息，查询相关域名时，将返回 NODATA 响应消息。
-- `group-dnl` 当前组的[域名列表文件](#域名列表)，多个用逗号隔开，可多次指定。
+- `group-dnl` 当前组的[域名列表文件](#域名列表)，多个用逗号隔开，可多次指定（支持 `.gz`）。
 - `group-upstream` 当前组的上游 DNS，多个用逗号隔开，可多次指定。
 - `group-ipset` 当前组的 ipset/nftset (可选)，用于收集解析出的结果 IP。
 
@@ -619,7 +620,7 @@ group-upstream 192.168.1.1
 
 **文件格式**
 
-域名列表是一个纯文本文件（不支持注释），每一行都是一个 **域名后缀**，如`baidu.com`、`www.google.com`。域名后缀不能以`.`开头或`.`结尾。出于性能考虑，最多允许 8 级域名（2025.03.27 版本之前是 4 级），超出部分将截断。
+域名列表是一个纯文本文件（不支持注释），每一行都是一个 **域名后缀**，如`baidu.com`、`www.google.com`。域名后缀不能以`.`开头或`.`结尾。出于性能考虑，最多允许 8 级域名（2025.03.27 版本之前是 4 级），超出部分将截断。也支持 gzip 压缩文件（`.gz`）。
 
 ---
 

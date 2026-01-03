@@ -125,6 +125,10 @@ static u32 add_name(const char *noalias name, u8 tag) {
     return nameaddr;
 }
 
+u32 dnl_add_name(const char *name, u8 tag) {
+    return add_name(name, tag);
+}
+
 static inline bool name_eq_r(u32 addr, uint hashv, u8 namelen, const char *noalias name) {
     const struct name *noalias p = ptr_name(addr);
     return p->hashv == hashv && p->namelen == namelen && memcmp(p->name, name, namelen) == 0;
@@ -383,6 +387,10 @@ static const char *check_name(const char *name) {
     return name;
 }
 
+const char *dnl_check_name(const char *name) {
+    return check_name(name);
+}
+
 /* "foo.www.google.com.hk" => ["hk", "com.hk", "google.com.hk", "www.google.com.hk"], #array=MAX_NAME_LEVEL */
 static int get_suffix(const char *noalias name, int namelen, const char *noalias suffix_array[noalias], int suffixlen_array[noalias]) {
     int array_len = 0, level = 1;
@@ -409,6 +417,13 @@ static int get_suffix(const char *noalias name, int namelen, const char *noalias
 
 /* ======================== domain list ======================== */
 
+extern bool dnl_load_list_gz(u8 tag, const char *fname, u32 *p_addr0, u32 *p_count);
+
+static bool has_gz_suffix(const char *fname) {
+    size_t n = strlen(fname);
+    return n >= 3 && memcmp(fname + n - 3, ".gz", 3) == 0;
+}
+
 /* return `has_domains` */
 static bool load_list(u8 tag, filenames_t filenames,
     u32 *noalias p_addr0, u32 *noalias p_count, u32 *noalias p_cost)
@@ -422,6 +437,18 @@ static bool load_list(u8 tag, filenames_t filenames,
         if (strcmp(fname, "-") == 0) {
             fp = stdin;
         } else {
+            if (has_gz_suffix(fname)) {
+                u32 gz_addr0 = 0, gz_count = 0;
+                if (dnl_load_list_gz(tag, fname, &gz_addr0, &gz_count)) {
+                    if (gz_count > 0) {
+                        if (count == 0) addr0 = gz_addr0;
+                        count += gz_count;
+                    }
+                } else {
+                    log_warning("failed to load gzip dnl: '%s'", fname);
+                }
+                continue;
+            }
             fp = fopen(fname, "rb");
             unlikely_if (!fp) {
                 log_warning("failed to open '%s': (%d) %m", fname, errno);
@@ -433,7 +460,7 @@ static bool load_list(u8 tag, filenames_t filenames,
         while (fscanf(fp, "%" literal(DNS_NAME_MAXLEN) "s", buf) > 0) {
             const char *name = check_name(buf);
             if (name) {
-                u32 nameaddr = add_name(name, tag);
+                u32 nameaddr = dnl_add_name(name, tag);
                 if (count++ == 0) addr0 = nameaddr;
             }
         }

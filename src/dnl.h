@@ -14,3 +14,7 @@ bool dnl_is_empty(void);
 
 /* check `dnl_is_empty()` before calling */
 u8 dnl_get_tag(const char *noalias name, int namelen, u8 default_tag);
+
+/* internal helpers (used by zig for .gz dnl loader) */
+const char *dnl_check_name(const char *name);
+u32 dnl_add_name(const char *name, u8 tag);
