@@ -359,6 +359,14 @@ u16 dns_empty_reply(void *noalias msg, int qnamelen) {
     return qnamelen > 0 ? msg_minlen(qnamelen) : sizeof(struct dns_header);
 }
 
+u16 dns_servfail_reply(void *noalias msg, int qnamelen) {
+    u16 len = dns_empty_reply(msg, qnamelen);
+    struct dns_header *h = msg;
+    h->aa = 0;
+    h->rcode = DNS_RCODE_SERVFAIL;
+    return len;
+}
+
 // return newlen (0 if failed)
 static u16 rm_additional(void *noalias msg, ssize_t len, int qnamelen) {
     if (!dns_is_good(msg))

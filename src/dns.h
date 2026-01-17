@@ -28,6 +28,7 @@
 #define DNS_QR_REPLY 1
 
 #define DNS_RCODE_NOERROR 0
+#define DNS_RCODE_SERVFAIL 2
 #define DNS_RCODE_NXDOMAIN 3
 
 #define DNS_CLASS_IN 1
@@ -73,6 +74,9 @@ u16 dns_truncate(const void *noalias msg, ssize_t len, void *noalias out);
 
 /* keep only the HEADER and QUESTION section */
 u16 dns_empty_reply(void *noalias msg, int qnamelen);
+
+/* keep only the HEADER and QUESTION section, set rcode=SERVFAIL */
+u16 dns_servfail_reply(void *noalias msg, int qnamelen);
 
 /* check query msg, `ascii_name` used to get domain name */
 bool dns_check_query(void *noalias msg, ssize_t len, char *noalias ascii_name, int *noalias p_qnamelen);

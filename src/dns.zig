@@ -65,6 +65,12 @@ pub inline fn empty_reply(msg: []u8, qnamelen: c_int) []u8 {
     return msg[0..len];
 }
 
+/// return the updated msg (SERVFAIL)
+pub inline fn servfail_reply(msg: []u8, qnamelen: c_int) []u8 {
+    const len = c.dns_servfail_reply(msg.ptr, qnamelen);
+    return msg[0..len];
+}
+
 /// check if the query msg is valid
 /// `ascii_name`: the buffer used to get the domain-name (ASCII-format)
 /// `p_qnamelen`: used to get the length of the domain-name (wire-format)

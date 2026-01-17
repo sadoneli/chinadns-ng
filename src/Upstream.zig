@@ -121,10 +121,10 @@ fn deinit(self: *const Upstream) void {
 // ======================================================
 
 /// [nosuspend] send query to upstream
-fn send(self: *Upstream, qmsg: *RcMsg) void {
-    nosuspend switch (self.proto) {
-        .udpi, .udp => if (self.udp_session()) |s| s.send_query(qmsg),
-        .tcpi, .tcp, .tls => if (self.tcp_session()) |s| s.send_query(qmsg),
+fn send(self: *Upstream, qmsg: *RcMsg) bool {
+    return nosuspend switch (self.proto) {
+        .udpi, .udp => if (self.udp_session()) |s| s.send_query(qmsg) else false,
+        .tcpi, .tcp, .tls => if (self.tcp_session()) |s| s.send_query(qmsg) else false,
         else => unreachable,
     };
 }
@@ -285,31 +285,35 @@ const UDP = struct {
     }
 
     /// [nosuspend]
-    pub fn send_query(self: *UDP, qmsg: *RcMsg) void {
+    pub fn send_query(self: *UDP, qmsg: *RcMsg) bool {
         if (self.is_retire()) {
             const new_session = new(self.upstream);
             self.upstream.session = new_session;
 
             if (new_session) |s|
-                nosuspend s.send_query(qmsg);
+                return nosuspend s.send_query(qmsg);
 
             if (self.is_idle())
                 self.free();
 
-            return;
+            return false;
         }
 
         if (self.proxy_enabled and !self.proxy_ready) {
-            // async socks5 udp associate + relay setup
-            self.proxy_pending.append(g.allocator, qmsg.ref()) catch unreachable;
+            // Don't queue queries while the proxy isn't ready; otherwise a boot-time proxy outage
+            // can retain many qmsg buffers and OOM the process. Let server reply SERVFAIL.
+            if (!g.proxy_can_try())
+                return false;
+
             if (!self.proxy_starting) {
                 self.proxy_starting = true;
                 co.start(proxy_init, .{self});
             }
-            return;
+            return false;
         }
 
         self.send_query_now(qmsg);
+        return true;
     }
 
     fn send_query_now(self: *UDP, qmsg: *RcMsg) void {
@@ -391,6 +395,8 @@ const UDP = struct {
             return;
 
         const proxy_addr = g.proxy_addr orelse return;
+        if (!g.proxy_can_try())
+            return;
 
         const proxy: cc.ConstStr = g.proxy_server orelse @ptrCast(cc.ConstStr, cc.to_cstr("(proxy)"));
 
@@ -413,12 +419,14 @@ const UDP = struct {
 
         g.evloop.connect(pfdobj, &proxy_addr) orelse {
             log.warn(@src(), "connect(%s) failed: (%d) %m", .{ proxy, cc.errno() });
+            g.proxy_note_fail();
             drop_pending(self);
             return;
         };
 
         if (socks5.greet_noauth(pfdobj)) |err| {
             log.warn(@src(), "connect(%s) failed: %s", .{ proxy, err });
+            g.proxy_note_fail();
             drop_pending(self);
             return;
         }
@@ -427,6 +435,7 @@ const UDP = struct {
         var tcp_local: cc.SockAddr = undefined;
         if (cc.getsockname(pfdobj.fd, &tcp_local) == null) {
             log.warn(@src(), "getsockname(%s) failed: (%d) %m", .{ proxy, cc.errno() });
+            g.proxy_note_fail();
             drop_pending(self);
             return;
         }
@@ -439,6 +448,7 @@ const UDP = struct {
 
         if (cc.bind(self.fdobj.fd, &udp_bind) == null) {
             log.warn(@src(), "bind(udp for %s) failed: (%d) %m", .{ proxy, cc.errno() });
+            g.proxy_note_fail();
             drop_pending(self);
             return;
         }
@@ -446,22 +456,28 @@ const UDP = struct {
         var udp_local: cc.SockAddr = undefined;
         if (cc.getsockname(self.fdobj.fd, &udp_local) == null) {
             log.warn(@src(), "getsockname(udp for %s) failed: (%d) %m", .{ proxy, cc.errno() });
+            g.proxy_note_fail();
             drop_pending(self);
             return;
         }
 
         if (socks5.request_udp_associate(pfdobj, &proxy_addr, &udp_local, &self.proxy_relay)) |err| {
             log.warn(@src(), "connect(%s) failed: %s", .{ proxy, err });
+            g.proxy_note_fail();
             drop_pending(self);
             return;
         }
 
-        const n = socks5.build_udp_datagram_prefix(&self.proxy_prefix, &self.upstream.addr) orelse return;
+        const n = socks5.build_udp_datagram_prefix(&self.proxy_prefix, &self.upstream.addr) orelse {
+            g.proxy_note_fail();
+            return;
+        };
         self.proxy_prefix_len = cc.to_u8(n);
 
         self.proxy_fdobj = pfdobj;
         self.proxy_ready = true;
         ok = true;
+        g.proxy_note_success();
 
         if (g.verbose()) {
             var ip: cc.IpStrBuf = undefined;
@@ -795,22 +811,34 @@ const TCP = struct {
     }
 
     /// add to send queue, `qmsg.ref++`
-    pub fn send_query(self: *TCP, qmsg: *RcMsg) void {
+    pub fn send_query(self: *TCP, qmsg: *RcMsg) bool {
+        const proxied = use_proxy(self.upstream);
+
         if (self.is_retire()) {
             const new_session = new(self.upstream);
             self.upstream.session = new_session;
 
-            nosuspend new_session.send_query(qmsg);
-
+            const ok = nosuspend new_session.send_query(qmsg);
             if (self.is_idle())
                 self.free();
 
-            return;
+            return ok;
+        }
+
+        if (proxied and !g.proxy_can_try())
+            return false;
+
+        // If proxy is enabled but the TCP session isn't connected yet, start connecting in background.
+        // We don't queue qmsg here; let server reply SERVFAIL and rely on client retry.
+        if (proxied and self.fdobj == null) {
+            if (!self.flags.starting)
+                self.start();
+            return false;
         }
 
         if (self.pending_n >= PENDING_MAX) {
             log.warn(@src(), "too many pending queries: %u", .{cc.to_uint(self.pending_n)});
-            return;
+            return false;
         }
 
         self.session_node.on_work(self.is_idle());
@@ -824,6 +852,8 @@ const TCP = struct {
         // must be at the end
         if (self.fdobj == null)
             self.start();
+
+        return true;
     }
 
     /// [suspending] pop from send_list && add to ack_list
@@ -882,6 +912,14 @@ const TCP = struct {
         }
 
         if (self.pending_n > 0) {
+            // If proxy is failing, drop queued qmsgs to avoid infinite reconnect loops + memory retention.
+            if (use_proxy(self.upstream) and !g.proxy_can_try()) {
+                self.clear_ack_list(.unref);
+                self.send_list.clear();
+                self.pending_n = 0;
+                self.session_node.on_idle();
+                return;
+            }
             if (!self.flags.starting) {
                 // restart
                 self.clear_ack_list(.resend);
@@ -915,9 +953,9 @@ const TCP = struct {
     /// may call `self.free()`
     fn start(self: *TCP) void {
         assert(self.fdobj == null);
-        assert(self.pending_n > 0);
-        assert(!self.send_list.is_empty());
         assert(self.ack_list.count() == 0);
+        if (self.pending_n == 0)
+            assert(self.send_list.is_empty());
 
         self.create_time = g.evloop.time;
 
@@ -1033,14 +1071,24 @@ const TCP = struct {
         const errmsg: ?cc.ConstStr = e: {
             const fdobj = self.fdobj.?;
             if (use_proxy(self.upstream)) {
+                if (!g.proxy_can_try())
+                    break :e "proxy backoff";
                 const proxy_addr = g.proxy_addr.?;
-                g.evloop.connect(fdobj, &proxy_addr) orelse break :e null;
+                g.evloop.connect(fdobj, &proxy_addr) orelse {
+                    g.proxy_note_fail();
+                    break :e null;
+                };
 
-                if (socks5.greet_noauth(fdobj)) |err|
+                if (socks5.greet_noauth(fdobj)) |err| {
+                    g.proxy_note_fail();
                     break :e err;
+                }
 
-                if (socks5.request_connect(fdobj, &self.upstream.addr)) |err|
+                if (socks5.request_connect(fdobj, &self.upstream.addr)) |err| {
+                    g.proxy_note_fail();
                     break :e err;
+                }
+                g.proxy_note_success();
             } else {
                 g.evloop.connect(fdobj, &self.upstream.addr) orelse break :e null;
             }
@@ -1368,7 +1416,7 @@ pub const Group = struct {
     // ======================================================
 
     /// [nosuspend]
-    pub fn send(self: *Group, qmsg: *RcMsg, udpi: bool) void {
+    pub fn send(self: *Group, qmsg: *RcMsg, udpi: bool) bool {
         const verbose_info = if (g.verbose()) .{
             .qid = dns.get_id(qmsg.msg()),
             .from = cc.b2s(udpi, "udp", "tcp"),
@@ -1376,6 +1424,7 @@ pub const Group = struct {
 
         const in_proto: Proto = if (udpi) .udpi else .tcpi;
 
+        var sent = false;
         for (self.items()) |*upstream| {
             if (upstream.proto == .udpi or upstream.proto == .tcpi)
                 if (upstream.proto != in_proto) continue;
@@ -1387,7 +1436,9 @@ pub const Group = struct {
                     .{ cc.to_uint(verbose_info.qid), verbose_info.from, upstream.url },
                 );
 
-            nosuspend upstream.send(qmsg);
+            sent = nosuspend upstream.send(qmsg) or sent;
         }
+
+        return sent;
     }
 };

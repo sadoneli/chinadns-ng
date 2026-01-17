@@ -95,3 +95,31 @@ pub var ca_certs: DynStr = .{};
 pub var proxy_server: ?cc.ConstStr = null;
 pub var proxy_addr: ?cc.SockAddr = null;
 pub var proxy_group_mask: u16 = 0; // bitset: 1 << Tag.int()
+
+// proxy failure backoff (monotonic ms, from evloop.time)
+pub var proxy_backoff_until: u64 = 0;
+pub var proxy_backoff_step: u8 = 0;
+
+pub inline fn proxy_can_try() bool {
+    return evloop.time >= proxy_backoff_until;
+}
+
+pub fn proxy_note_success() void {
+    proxy_backoff_until = 0;
+    proxy_backoff_step = 0;
+}
+
+pub fn proxy_note_fail() void {
+    const now = evloop.time;
+
+    // Exponential backoff: 200ms, 400ms, 800ms ... up to 30s
+    if (proxy_backoff_step < 10)
+        proxy_backoff_step += 1;
+
+    const shift: u6 = @intCast(u6, if (proxy_backoff_step > 1) proxy_backoff_step - 1 else 0);
+    var delay: u64 = 200;
+    delay = delay << shift;
+    if (delay > 30_000) delay = 30_000;
+
+    proxy_backoff_until = now + delay;
+}

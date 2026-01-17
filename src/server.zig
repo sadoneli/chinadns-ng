@@ -48,6 +48,7 @@ const Query = struct {
     pub const Flags = packed struct {
         from: enum(u2) { udp, tcp, local }, // from.local: {fdobj, src_addr} = undefined
         verdict: enum(u2) { nil, is_china, non_china } = .nil, // [tag:none] `?bool` is better, but can't be used in packed struct
+        trust_failed: bool = false, // [tag:none] trust upstream not sent (proxy/backoff), avoid waiting forever
 
         /// query from udp/tcp client
         pub inline fn from_client(self: Flags) bool {
@@ -555,19 +556,40 @@ fn on_query(qmsg: *RcMsg, fdobj: *EvLoop.Fd, src_addr: *const cc.SockAddr, in_qf
     ) orelse return;
 
     if (tag == .none) {
+        var sent_any = false;
         if (tagnone_to_china)
-            send_query(.chn, qmsg, udpi, q, &qlog);
-        if (tagnone_to_trust)
-            send_query(.gfw, qmsg, udpi, q, &qlog);
+            sent_any = send_query(.chn, qmsg, udpi, q, &qlog) or sent_any;
+        if (tagnone_to_trust) {
+            const sent_trust = send_query(.gfw, qmsg, udpi, q, &qlog);
+            sent_any = sent_trust or sent_any;
+            if (!sent_trust)
+                q.flags.trust_failed = true;
+        }
+
+        if (!sent_any) {
+            if (q.flags.from_client()) {
+                const rmsg = dns.servfail_reply(msg, qnamelen);
+                send_reply(rmsg, q.fdobj, &q.src_addr, q.bufsz, q.id, q.flags);
+            }
+            _query_list.del(q);
+            return;
+        }
     } else {
-        send_query(tag, qmsg, udpi, q, &qlog);
+        if (!send_query(tag, qmsg, udpi, q, &qlog)) {
+            if (q.flags.from_client()) {
+                const rmsg = dns.servfail_reply(msg, qnamelen);
+                send_reply(rmsg, q.fdobj, &q.src_addr, q.bufsz, q.id, q.flags);
+            }
+            _query_list.del(q);
+            return;
+        }
     }
 }
 
 /// nosuspend
-fn send_query(to_tag: Tag, qmsg: *RcMsg, udpi: bool, q: *const Query, qlog: *const QueryLog) void {
+fn send_query(to_tag: Tag, qmsg: *RcMsg, udpi: bool, q: *const Query, qlog: *const QueryLog) bool {
     if (g.verbose()) qlog.forward(q, to_tag);
-    nosuspend groups.get_upstream_group(to_tag).send(qmsg, udpi);
+    return nosuspend groups.get_upstream_group(to_tag).send(qmsg, udpi);
 }
 
 // =========================================================================
@@ -720,9 +742,16 @@ pub fn on_reply(rmsg: *RcMsg, upstream: *const Upstream) void {
                             rlog.reply("accept", "<previous-trustdns>");
                         msg = trust_msg.msg();
                     } else {
-                        // waiting for response from trust
-                        q.flags.verdict = .non_china;
-                        return;
+                        if (q.flags.trust_failed) {
+                            if (g.verbose())
+                                rlog.reply("servfail", null);
+                            msg = dns.servfail_reply(msg, qnamelen);
+                            rmsg.len = cc.to_u16(msg.len);
+                        } else {
+                            // waiting for response from trust
+                            q.flags.verdict = .non_china;
+                            return;
+                        }
                     }
                 }
             },
