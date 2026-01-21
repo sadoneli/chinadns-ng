@@ -217,9 +217,10 @@ const UDP = struct {
     upstream: *Upstream,
     fdobj: *EvLoop.Fd,
     proxy_fdobj: ?*EvLoop.Fd = null, // socks5 tcp control channel (UDP ASSOCIATE)
-    query_list: std.AutoHashMapUnmanaged(u16, void) = .{}, // outstanding queries (qid)
+    query_list: std.AutoHashMapUnmanaged(u16, u64) = .{}, // outstanding queries (qid => sent_at ms)
     create_time: u64,
     query_time: u64 = undefined, // last query time
+    oldest_query_time: u64 = 0, // oldest outstanding query time
     query_count: u16 = 0, // total query count
     freed: bool = false,
     proxy_enabled: bool = false,
@@ -286,17 +287,22 @@ const UDP = struct {
 
     /// [nosuspend]
     pub fn send_query(self: *UDP, qmsg: *RcMsg) bool {
-        if (self.is_retire()) {
-            const new_session = new(self.upstream);
-            self.upstream.session = new_session;
+        if (self.should_retire()) {
+            if (!self.upstream.session_eql(self))
+                return false;
+            if (self.is_idle()) {
+                self.retire();
+                const new_session = new(self.upstream);
+                self.upstream.session = new_session;
 
-            if (new_session) |s|
-                return nosuspend s.send_query(qmsg);
+                if (new_session) |s|
+                    return nosuspend s.send_query(qmsg);
 
-            if (self.is_idle())
-                self.free();
+                if (self.is_idle())
+                    self.free();
 
-            return false;
+                return false;
+            }
         }
 
         if (self.proxy_enabled and !self.proxy_ready) {
@@ -318,6 +324,9 @@ const UDP = struct {
 
     fn send_query_now(self: *UDP, qmsg: *RcMsg) void {
         assert(!self.proxy_enabled or self.proxy_ready);
+        const now = g.evloop.time;
+
+        self.cleanup_stale_queries(now);
 
         if (self.upstream.tag == .gfw and g.trustdns_packet_n > 1) {
             var iov = [_]cc.iovec_t{
@@ -377,8 +386,10 @@ const UDP = struct {
 
         self.session_node.on_work(self.is_idle());
 
-        self.query_list.put(g.allocator, dns.get_id(qmsg.msg()), {}) catch unreachable;
-        self.query_time = g.evloop.time;
+        self.query_list.put(g.allocator, dns.get_id(qmsg.msg()), now) catch unreachable;
+        if (self.oldest_query_time == 0)
+            self.oldest_query_time = now;
+        self.query_time = now;
         self.query_count +|= 1;
 
         // start recv coroutine, must be at the end
@@ -501,18 +512,48 @@ const UDP = struct {
 
     /// no more queries will be sent. \
     /// freed when the queries completes.
-    fn is_retire(self: *const UDP) bool {
+    fn should_retire(self: *const UDP) bool {
         if (!self.upstream.session_eql(self))
             return true;
 
         if ((self.upstream.count > 0 and self.query_count >= self.upstream.count) or
             (self.upstream.life > 0 and g.evloop.time >= self.create_time + cc.to_u64(self.upstream.life) * 1000))
-        {
-            self.upstream.session = null;
             return true;
-        }
 
         return false;
+    }
+
+    fn retire(self: *UDP) void {
+        if (self.upstream.session_eql(self))
+            self.upstream.session = null;
+    }
+
+    fn cleanup_stale_queries(self: *UDP, now: u64) void {
+        if (self.query_list.count() == 0) {
+            self.oldest_query_time = 0;
+            return;
+        }
+
+        const timeout_ms = cc.to_u64(g.upstream_timeout) * 1000;
+        if (timeout_ms == 0)
+            return;
+
+        if (self.oldest_query_time != 0 and now < self.oldest_query_time + timeout_ms)
+            return;
+
+        var oldest: u64 = 0;
+        var it = self.query_list.iterator();
+        while (it.next()) |entry| {
+            const qid = entry.key_ptr.*;
+            const sent_at = entry.value_ptr.*;
+            if (now - sent_at >= timeout_ms) {
+                _ = self.query_list.remove(qid);
+                continue;
+            }
+            if (oldest == 0 or sent_at < oldest)
+                oldest = sent_at;
+        }
+        self.oldest_query_time = oldest;
     }
 
     fn reply_receiver(self: *UDP) void {
@@ -551,7 +592,11 @@ const UDP = struct {
             // update query_list
             if (len >= dns.header_len()) {
                 const qid = dns.get_id(rmsg.msg());
-                _ = self.query_list.remove(qid);
+                if (self.query_list.get(qid)) |sent_at| {
+                    _ = self.query_list.remove(qid);
+                    if (sent_at == self.oldest_query_time or self.query_list.count() == 0)
+                        self.oldest_query_time = 0;
+                }
             }
 
             // will modify the msg.id
@@ -562,8 +607,10 @@ const UDP = struct {
                 if (!prev_idle)
                     self.session_node.on_idle();
 
-                if (self.is_retire())
+                if (self.should_retire()) {
+                    self.retire();
                     return; // free
+                }
             }
         }
     }
