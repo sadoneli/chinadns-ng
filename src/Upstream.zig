@@ -223,6 +223,8 @@ const UDP = struct {
     oldest_query_time: u64 = 0, // oldest outstanding query time
     query_count: u16 = 0, // total query count
     freed: bool = false,
+    closing: bool = false,
+    active: u8 = 0, // running coroutines (reply_receiver/proxy_init)
     proxy_enabled: bool = false,
     proxy_ready: bool = false,
     proxy_starting: bool = false,
@@ -255,6 +257,16 @@ const UDP = struct {
     /// - check_timeout
     fn free(self: *UDP) void {
         if (self.freed) return;
+        if (self.active > 0) {
+            self.closing = true;
+            if (self.upstream.session_eql(self))
+                self.upstream.session = null;
+            self.fdobj.cancel();
+            if (self.proxy_fdobj) |pfdobj|
+                pfdobj.cancel();
+            return;
+        }
+
         self.freed = true;
 
         for (self.proxy_pending.items) |qmsg|
@@ -400,9 +412,18 @@ const UDP = struct {
     fn proxy_init(self: *UDP) void {
         defer co.terminate(@frame(), @frameSize(proxy_init));
 
-        defer self.proxy_starting = false;
+        self.active += 1;
+        defer {
+            self.proxy_starting = false;
+            assert(self.active > 0);
+            self.active -= 1;
+            self.free();
+        }
 
         if (!self.proxy_enabled)
+            return;
+
+        if (self.closing)
             return;
 
         const proxy_addr = g.proxy_addr orelse return;
@@ -542,24 +563,36 @@ const UDP = struct {
             return;
 
         var oldest: u64 = 0;
+        var stale: std.ArrayListUnmanaged(u16) = .{};
+        defer stale.clearAndFree(g.allocator);
+
         var it = self.query_list.iterator();
         while (it.next()) |entry| {
             const qid = entry.key_ptr.*;
             const sent_at = entry.value_ptr.*;
             if (now - sent_at >= timeout_ms) {
-                _ = self.query_list.remove(qid);
+                stale.append(g.allocator, qid) catch unreachable;
                 continue;
             }
             if (oldest == 0 or sent_at < oldest)
                 oldest = sent_at;
         }
+
+        for (stale.items) |qid|
+            _ = self.query_list.remove(qid);
+
         self.oldest_query_time = oldest;
     }
 
     fn reply_receiver(self: *UDP) void {
         defer co.terminate(@frame(), @frameSize(reply_receiver));
 
-        defer self.free();
+        self.active += 1;
+        defer {
+            assert(self.active > 0);
+            self.active -= 1;
+            self.free();
+        }
 
         var free_rmsg: ?*RcMsg = null;
         defer if (free_rmsg) |rmsg| rmsg.free();
@@ -573,11 +606,18 @@ const UDP = struct {
             const rmsg = free_rmsg orelse RcMsg.new(cap);
             free_rmsg = null;
 
+            // Keep a guard ref during processing to avoid premature free if refcount is corrupted elsewhere.
+            _ = rmsg.ref();
             defer {
-                if (rmsg.is_unique())
-                    free_rmsg = rmsg
-                else
-                    rmsg.unref();
+                const refs = rmsg.ref_count();
+                if (refs == 2) {
+                    free_rmsg = rmsg;
+                    rmsg.unref(); // drop guard
+                } else {
+                    rmsg.unref(); // drop guard
+                    if (refs > 2)
+                        rmsg.unref(); // drop receiver ref
+                }
             }
 
             const raw_len = g.evloop.read_udp(self.fdobj, rmsg.buf(), null) orelse return self.on_error("recv");
@@ -690,11 +730,14 @@ const TCP = struct {
     query_time: u64 = undefined, // last query time
     query_count: u16 = 0, // total query count
     pending_n: u16 = 0, // outstanding queries: send_list + ack_list
+    active: u8 = 0, // running coroutines (query_sender/reply_receiver)
     flags: packed struct {
         freed: bool = false, // free()
+        closing: bool = false, // close requested, waiting for active coroutines
         starting: bool = false, // start()
         stopping: bool = false, // stop()
         in_sender: bool = false, // query_sender()
+        stop_requested: bool = false, // stop requested while query_sender is active
     } = .{},
 
     const TLS_ = if (has_tls) TLS else struct {};
@@ -805,6 +848,16 @@ const TCP = struct {
 
     pub fn free(self: *TCP) void {
         if (self.flags.freed) return;
+        if (self.active > 0) {
+            self.flags.closing = true;
+            if (self.upstream.session_eql(self))
+                self.upstream.session = null;
+            self.send_list.cancel_wait();
+            if (self.fdobj) |fdobj|
+                fdobj.cancel();
+            return;
+        }
+
         self.flags.freed = true;
 
         if (!self.is_idle())
@@ -933,8 +986,11 @@ const TCP = struct {
     }
 
     fn stop(self: *TCP) void {
-        if (self.flags.in_sender) {
-            self.flags.stopping = true;
+        if (self.active > 1 or self.flags.in_sender) {
+            self.flags.stop_requested = true;
+            self.send_list.cancel_wait();
+            if (self.fdobj) |fdobj|
+                fdobj.cancel();
             return;
         }
 
@@ -945,6 +1001,7 @@ const TCP = struct {
             // cleanup
             self.flags.stopping = true;
             defer self.flags.stopping = false;
+            self.flags.stop_requested = false;
 
             self.send_list.cancel_wait();
 
@@ -956,6 +1013,16 @@ const TCP = struct {
 
             if (has_tls)
                 self.tls.on_close();
+        }
+
+        if (self.flags.closing) {
+            const had_pending = self.pending_n > 0;
+            self.clear_ack_list(.unref);
+            self.send_list.clear();
+            self.pending_n = 0;
+            if (had_pending)
+                self.session_node.on_idle();
+            return;
         }
 
         if (self.pending_n > 0) {
@@ -1017,7 +1084,16 @@ const TCP = struct {
     fn query_sender(self: *TCP) void {
         defer co.terminate(@frame(), @frameSize(query_sender));
 
-        defer self.stop();
+        self.active += 1;
+        defer {
+            self.flags.in_sender = false;
+            self.stop();
+            assert(self.active > 0);
+            self.active -= 1;
+            if (self.flags.closing)
+                self.free();
+        }
+        self.flags.in_sender = true;
 
         const family = if (use_proxy(self.upstream))
             g.proxy_addr.?.family()
@@ -1028,23 +1104,33 @@ const TCP = struct {
 
         self.connect() orelse return;
 
-        self.flags.in_sender = true;
         co.start(reply_receiver, .{self});
-        self.flags.in_sender = false;
 
-        if (self.flags.stopping) {
-            self.flags.stopping = false;
+        if (self.flags.stop_requested) {
+            self.flags.stop_requested = false;
             return; // do stop()
         }
 
-        while (self.pop_qmsg()) |qmsg|
+        while (self.pop_qmsg()) |qmsg| {
+            if (self.flags.stop_requested) {
+                self.flags.stop_requested = false;
+                return;
+            }
             self.send(qmsg) orelse return;
+        }
     }
 
     fn reply_receiver(self: *TCP) void {
         defer co.terminate(@frame(), @frameSize(reply_receiver));
 
-        defer self.stop();
+        self.active += 1;
+        defer {
+            self.stop();
+            assert(self.active > 0);
+            self.active -= 1;
+            if (self.flags.closing)
+                self.free();
+        }
 
         var free_rmsg: ?*RcMsg = null;
         defer if (free_rmsg) |rmsg| rmsg.free();
@@ -1064,11 +1150,18 @@ const TCP = struct {
             const rmsg: *RcMsg = if (free_rmsg) |rmsg| rmsg.realloc(len) else RcMsg.new(len);
             free_rmsg = null;
 
+            // Keep a guard ref during processing to avoid premature free if refcount is corrupted elsewhere.
+            _ = rmsg.ref();
             defer {
-                if (rmsg.is_unique())
-                    free_rmsg = rmsg
-                else
-                    rmsg.unref();
+                const refs = rmsg.ref_count();
+                if (refs == 2) {
+                    free_rmsg = rmsg;
+                    rmsg.unref(); // drop guard
+                } else {
+                    rmsg.unref(); // drop guard
+                    if (refs > 2)
+                        rmsg.unref(); // drop receiver ref
+                }
             }
 
             // read the msg
