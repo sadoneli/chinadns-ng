@@ -31,10 +31,12 @@ const Query = struct {
     // alignment: 8/4
     fdobj: *EvLoop.Fd, // requester's fdobj
     trust_msg: ?*RcMsg = null,
+    req_msg: ?*RcMsg = null,
     req_time: u64, // monotonic time (ms)
 
     // alignment: 4
     src_addr: cc.SockAddr,
+    qnamelen: c_int,
 
     // alignment: 2
     qid: u16,
@@ -64,7 +66,17 @@ const Query = struct {
         }
     };
 
-    fn new(qid: u16, id: c.be16, bufsz: u16, fdobj: *EvLoop.Fd, src_addr: *const cc.SockAddr, tag: Tag, flags: Flags) *Query {
+    fn new(
+        qid: u16,
+        id: c.be16,
+        bufsz: u16,
+        fdobj: *EvLoop.Fd,
+        src_addr: *const cc.SockAddr,
+        qnamelen: c_int,
+        tag: Tag,
+        flags: Flags,
+        req_msg: ?*RcMsg,
+    ) *Query {
         const self = g.allocator.create(Query) catch unreachable;
 
         self.* = .{
@@ -76,6 +88,8 @@ const Query = struct {
             .tag = tag,
             .flags = flags,
             .req_time = g.evloop.time,
+            .qnamelen = qnamelen,
+            .req_msg = if (flags.from_client()) req_msg.?.ref() else null,
         };
 
         return self;
@@ -86,6 +100,9 @@ const Query = struct {
             self.fdobj.unref();
 
         if (self.trust_msg) |msg| {
+            msg.unref();
+        }
+        if (self.req_msg) |msg| {
             msg.unref();
         }
 
@@ -123,6 +140,14 @@ const Query = struct {
             );
         }
 
+        if (self.flags.from_client()) {
+            if (self.req_msg) |qmsg| {
+                const msg = dns.servfail_reply(qmsg.msg(), self.qnamelen);
+                qmsg.len = cc.to_u16(msg.len);
+                send_reply(msg, self.fdobj, &self.src_addr, self.bufsz, self.id, self.flags);
+            }
+        }
+
         _query_list.del(self);
     }
 
@@ -150,8 +175,10 @@ const Query = struct {
             fdobj: *EvLoop.Fd,
             src_addr: *const cc.SockAddr,
             bufsz: u16,
+            qnamelen: c_int,
             tag: Tag,
             flags: Flags,
+            req_msg: ?*RcMsg,
         ) ?*Query {
             const src = @src();
 
@@ -174,7 +201,7 @@ const Query = struct {
             const id = dns.get_id(msg);
             dns.set_id(msg, qid);
 
-            const q = Query.new(qid, id, bufsz, fdobj, src_addr, tag, flags);
+            const q = Query.new(qid, id, bufsz, fdobj, src_addr, qnamelen, tag, flags, req_msg);
 
             self.map.putNoClobber(g.allocator, qid, q) catch unreachable;
             self.list.link_to_tail(&q.node);
@@ -260,11 +287,18 @@ fn tcp_server(fd: c_int, p_src_addr: *const cc.SockAddr) void {
             const qmsg = free_qmsg orelse RcMsg.new(c.DNS_QMSG_MAXSIZE);
             free_qmsg = null;
 
+            // Keep a guard ref during processing to avoid premature free if refcount is corrupted elsewhere.
+            _ = qmsg.ref();
             defer {
-                if (qmsg.is_unique())
-                    free_qmsg = qmsg
-                else
-                    qmsg.unref();
+                const refs = qmsg.ref_count();
+                if (refs == 2) {
+                    free_qmsg = qmsg;
+                    qmsg.unref(); // drop guard
+                } else {
+                    qmsg.unref(); // drop guard
+                    if (refs > 2)
+                        qmsg.unref(); // drop tcp_server ref
+                }
             }
 
             // read msg
@@ -301,11 +335,18 @@ fn udp_server(fd: c_int, ip: cc.ConstStr, port: u16) void {
         const qmsg = free_qmsg orelse RcMsg.new(c.DNS_QMSG_MAXSIZE);
         free_qmsg = null;
 
+        // Keep a guard ref during processing to avoid premature free if refcount is corrupted elsewhere.
+        _ = qmsg.ref();
         defer {
-            if (qmsg.is_unique())
-                free_qmsg = qmsg
-            else
-                qmsg.unref();
+            const refs = qmsg.ref_count();
+            if (refs == 2) {
+                free_qmsg = qmsg;
+                qmsg.unref(); // drop guard
+            } else {
+                qmsg.unref(); // drop guard
+                if (refs > 2)
+                    qmsg.unref(); // drop udp_server ref
+            }
         }
 
         var src_addr: cc.SockAddr = undefined;
@@ -329,6 +370,7 @@ comptime {
 
 const QueryLog = struct {
     name: cc.ConstStr,
+    name_len: u16,
     src_port: u16,
     id: u16,
     qtype: u16,
@@ -338,16 +380,24 @@ const QueryLog = struct {
     pub noinline fn query(self: *const QueryLog) void {
         log.info(
             @src(),
-            "query(id:%u, tag:%s, qtype:%u, '%s') from %s#%u",
-            .{ cc.to_uint(self.id), self.tag.name(), cc.to_uint(self.qtype), self.name, &self.src_ip, cc.to_uint(self.src_port) },
+            "query(id:%u, tag:%s, qtype:%u, '%.*s') from %s#%u",
+            .{
+                cc.to_uint(self.id),
+                self.tag.name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                &self.src_ip,
+                cc.to_uint(self.src_port),
+            },
         );
     }
 
     pub noinline fn noaaaa(self: *const QueryLog, rule: cc.ConstStr) void {
         log.info(
             @src(),
-            "query(id:%u, tag:%s, qtype:AAAA, '%s') filtered by rule: %s",
-            .{ cc.to_uint(self.id), self.tag.name(), self.name, rule },
+            "query(id:%u, tag:%s, qtype:AAAA, '%.*s') filtered by rule: %s",
+            .{ cc.to_uint(self.id), self.tag.name(), cc.to_int(self.name_len), self.name, rule },
         );
     }
 
@@ -359,40 +409,77 @@ const QueryLog = struct {
         };
         log.info(
             @src(),
-            "query(id:%u, tag:%s, qtype:%u, '%s') filtered by rule: %s",
-            .{ cc.to_uint(self.id), self.tag.name(), cc.to_uint(self.qtype), self.name, rule_str },
+            "query(id:%u, tag:%s, qtype:%u, '%.*s') filtered by rule: %s",
+            .{
+                cc.to_uint(self.id),
+                self.tag.name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                rule_str,
+            },
         );
     }
 
     pub noinline fn local_rr(self: *const QueryLog, answer_n: u16, answer_sz: usize) void {
         log.info(
             @src(),
-            "local_rr(id:%u, tag:%s, qtype:%u, '%s') answer_n:%u size:%zu",
-            .{ cc.to_uint(self.id), self.tag.name(), cc.to_uint(self.qtype), self.name, cc.to_uint(answer_n), answer_sz },
+            "local_rr(id:%u, tag:%s, qtype:%u, '%.*s') answer_n:%u size:%zu",
+            .{
+                cc.to_uint(self.id),
+                self.tag.name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                cc.to_uint(answer_n),
+                answer_sz,
+            },
         );
     }
 
     pub noinline fn cache(self: *const QueryLog, cache_msg: []const u8, ttl: i32) void {
         log.info(
             @src(),
-            "hit cache(id:%u, tag:%s, qtype:%u, '%s') size:%zu ttl:%ld",
-            .{ cc.to_uint(self.id), self.tag.name(), cc.to_uint(self.qtype), self.name, cache_msg.len, cc.to_long(ttl) },
+            "hit cache(id:%u, tag:%s, qtype:%u, '%.*s') size:%zu ttl:%ld",
+            .{
+                cc.to_uint(self.id),
+                self.tag.name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                cache_msg.len,
+                cc.to_long(ttl),
+            },
         );
     }
 
     pub noinline fn refresh(self: *const QueryLog, ttl: i32) void {
         log.info(
             @src(),
-            "refresh cache(id:%u, tag:%s, qtype:%u, '%s') ttl:%ld",
-            .{ cc.to_uint(self.id), self.tag.name(), cc.to_uint(self.qtype), self.name, cc.to_long(ttl) },
+            "refresh cache(id:%u, tag:%s, qtype:%u, '%.*s') ttl:%ld",
+            .{
+                cc.to_uint(self.id),
+                self.tag.name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                cc.to_long(ttl),
+            },
         );
     }
 
     pub noinline fn add_ip(self: *const QueryLog, setnames: cc.ConstStr) void {
         log.info(
             @src(),
-            "add answer_ip(id:%u, tag:%s, qtype:%u, '%s') to %s",
-            .{ cc.to_uint(self.id), self.tag.name(), cc.to_uint(self.qtype), self.name, setnames },
+            "add answer_ip(id:%u, tag:%s, qtype:%u, '%.*s') to %s",
+            .{
+                cc.to_uint(self.id),
+                self.tag.name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                setnames,
+            },
         );
     }
 
@@ -407,8 +494,8 @@ const QueryLog = struct {
 
         log.info(
             @src(),
-            "forward query(qid:%u, from:%s, '%s') to %s group",
-            .{ cc.to_uint(q.qid), from, self.name, to },
+            "forward query(qid:%u, from:%s, '%.*s') to %s group",
+            .{ cc.to_uint(q.qid), from, cc.to_int(self.name_len), self.name, to },
         );
     }
 };
@@ -441,6 +528,7 @@ fn on_query(qmsg: *RcMsg, fdobj: *EvLoop.Fd, src_addr: *const cc.SockAddr, in_qf
         .qtype = qtype,
         .tag = tag,
         .name = &ascii_namebuf,
+        .name_len = cc.to_u16(c.strlen(&ascii_namebuf)),
     } else undefined;
 
     if (g.verbose()) {
@@ -550,9 +638,17 @@ fn on_query(qmsg: *RcMsg, fdobj: *EvLoop.Fd, src_addr: *const cc.SockAddr, in_qf
         fdobj,
         src_addr,
         bufsz,
+        qnamelen,
         tag,
         qflags,
-    ) orelse return;
+        if (qflags.from_client()) qmsg else null,
+    ) orelse {
+        if (qflags.from_client()) {
+            const rmsg = dns.servfail_reply(msg, qnamelen);
+            send_reply(rmsg, fdobj, src_addr, bufsz, dns.get_id(msg), qflags);
+        }
+        return;
+    };
 
     if (tag == .none) {
         var sent_any = false;
@@ -588,6 +684,15 @@ fn on_query(qmsg: *RcMsg, fdobj: *EvLoop.Fd, src_addr: *const cc.SockAddr, in_qf
 /// nosuspend
 fn send_query(to_tag: Tag, qmsg: *RcMsg, udpi: bool, q: *const Query, qlog: *const QueryLog) bool {
     if (g.verbose()) qlog.forward(q, to_tag);
+
+    if (!to_tag.valid() or to_tag.is_null()) {
+        if (g.verbose())
+            log.warn(@src(), "invalid tag:%u for query '%s'", .{ cc.to_uint(to_tag.int()), qlog.name })
+        else
+            log.warn(@src(), "invalid tag:%u for query", .{cc.to_uint(to_tag.int())});
+        return false;
+    }
+
     return nosuspend groups.get_upstream_group(to_tag).send(qmsg, udpi);
 }
 
@@ -601,6 +706,7 @@ comptime {
 
 const ReplyLog = struct {
     name: cc.ConstStr,
+    name_len: u16,
     url: cc.ConstStr,
     qid: u16,
     qtype: u16,
@@ -615,24 +721,39 @@ const ReplyLog = struct {
         const url = alt_url orelse self.url;
         log.info(
             @src(),
-            "reply(qid:%u, tag:%s, qtype:%u, '%s') from %s [%s]",
-            .{ cc.to_uint(self.qid), self.tag_name(), cc.to_uint(self.qtype), self.name, url, action },
+            "reply(qid:%u, tag:%s, qtype:%u, '%.*s') from %s [%s]",
+            .{
+                cc.to_uint(self.qid),
+                self.tag_name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                url,
+                action,
+            },
         );
     }
 
     pub noinline fn add_ip(self: *const ReplyLog, setnames: cc.ConstStr) void {
         log.info(
             @src(),
-            "add answer_ip(qid:%u, tag:%s, qtype:%u, '%s') to %s",
-            .{ cc.to_uint(self.qid), self.tag_name(), cc.to_uint(self.qtype), self.name, setnames },
+            "add answer_ip(qid:%u, tag:%s, qtype:%u, '%.*s') to %s",
+            .{
+                cc.to_uint(self.qid),
+                self.tag_name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                setnames,
+            },
         );
     }
 
     pub noinline fn noaaaa(self: *const ReplyLog, rule: cc.ConstStr) void {
         log.info(
             @src(),
-            "reply(qid:%u, tag:%s, qtype:AAAA, '%s') filtered by rule: %s",
-            .{ cc.to_uint(self.qid), self.tag_name(), self.name, rule },
+            "reply(qid:%u, tag:%s, qtype:AAAA, '%.*s') filtered by rule: %s",
+            .{ cc.to_uint(self.qid), self.tag_name(), cc.to_int(self.name_len), self.name, rule },
         );
     }
 
@@ -640,16 +761,31 @@ const ReplyLog = struct {
         const action = cc.b2s(g.flags.noip_as_chnip, "accept", "filter");
         log.info(
             @src(),
-            "reply(qid:%u, tag:%s, qtype:%u, '%s') has no answer ip [%s]",
-            .{ cc.to_uint(self.qid), self.tag_name(), cc.to_uint(self.qtype), self.name, action },
+            "reply(qid:%u, tag:%s, qtype:%u, '%.*s') has no answer ip [%s]",
+            .{
+                cc.to_uint(self.qid),
+                self.tag_name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                action,
+            },
         );
     }
 
     pub noinline fn cache(self: *const ReplyLog, ttl: i32, sz: usize) void {
         log.info(
             @src(),
-            "add cache(qid:%u, tag:%s, qtype:%u, '%s') size:%zu ttl:%ld",
-            .{ cc.to_uint(self.qid), self.tag_name(), cc.to_uint(self.qtype), self.name, sz, cc.to_long(ttl) },
+            "add cache(qid:%u, tag:%s, qtype:%u, '%.*s') size:%zu ttl:%ld",
+            .{
+                cc.to_uint(self.qid),
+                self.tag_name(),
+                cc.to_uint(self.qtype),
+                cc.to_int(self.name_len),
+                self.name,
+                sz,
+                cc.to_long(ttl),
+            },
         );
     }
 };
@@ -692,6 +828,12 @@ pub fn on_reply(rmsg: *RcMsg, upstream: *const Upstream) void {
     rmsg.len = newlen;
     msg = rmsg.msg();
 
+    const min_len = @as(usize, dns.header_len()) + dns.question_len(qnamelen);
+    if (min_len > msg.len) {
+        log.warn(@src(), "dns.check_reply(%s) failed: short reply msg", .{upstream.url});
+        return;
+    }
+
     const qtype = dns.get_qtype(msg, qnamelen);
     const is_qtype_A_AAAA = qtype == c.DNS_TYPE_A or qtype == c.DNS_TYPE_AAAA;
 
@@ -700,6 +842,7 @@ pub fn on_reply(rmsg: *RcMsg, upstream: *const Upstream) void {
         .tag = null,
         .qtype = qtype,
         .name = &ascii_namebuf,
+        .name_len = cc.to_u16(c.strlen(&ascii_namebuf)),
         .url = upstream.url,
     } else undefined;
 
@@ -809,6 +952,9 @@ pub fn on_reply(rmsg: *RcMsg, upstream: *const Upstream) void {
 
 /// [sync && nosuspend]
 fn send_reply(msg: []const u8, fdobj: *EvLoop.Fd, src_addr: *const cc.SockAddr, bufsz: u16, id: c.be16, qflags: Query.Flags) void {
+    if (msg.len < @as(usize, dns.header_len()))
+        return;
+
     var iovec = [_]cc.iovec_t{
         undefined, // for tcp (length field)
         .{

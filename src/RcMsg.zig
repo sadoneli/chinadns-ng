@@ -64,6 +64,10 @@ pub fn free(self: *RcMsg) void {
         g.allocator.free(self.mem());
 }
 
+pub inline fn ref_count(self: *const RcMsg) u32 {
+    return self.rc.ref_count;
+}
+
 /// ref count is 1
 pub fn is_unique(self: *const RcMsg) bool {
     return self.rc.ref_count == 1;
