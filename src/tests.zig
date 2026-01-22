@@ -64,7 +64,8 @@ pub fn main() u8 {
             },
             else => {
                 failed_count += 1;
-                cc.printf_err("\x1b[31;1merror: %s\x1b[0m\n", .{@errorName(err).ptr});
+                const err_name = @errorName(err);
+                cc.printf_err("\x1b[31;1merror: %.*s\x1b[0m\n", .{ @intCast(c_int, err_name.len), err_name.ptr });
                 if (@errorReturnTrace()) |trace|
                     std.debug.dumpStackTrace(trace.*);
                 cc.printf_err("%-35s [\x1b[31;1mFAILED\x1b[0m]\n", .{test_fn.name.ptr});

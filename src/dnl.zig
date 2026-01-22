@@ -79,7 +79,12 @@ fn readToken(reader: anytype, buf_z: []u8) !?usize {
 /// Called from `src/dnl.c` when a domain list filename ends with `.gz`.
 /// Decompresses the gzip stream and feeds tokens into dnl's internal allocator.
 pub export fn dnl_load_list_gz(tag: u8, fname_z: [*:0]const u8, p_addr0: *u32, p_count: *u32) bool {
-    const path = cstrSliceBounded(fname_z, cc.to_usize(c.PATH_MAX));
+    const max_path = cc.to_usize(c.PATH_MAX);
+    const path = cstrSliceBounded(fname_z, max_path);
+    if (path.len == max_path) {
+        log.warn(@src(), "gzip dnl path too long (>= %d bytes)", .{ c.PATH_MAX });
+        return false;
+    }
     var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| {
         const err_name = @errorName(err);
         log.warn(

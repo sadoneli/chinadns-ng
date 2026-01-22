@@ -130,14 +130,15 @@ pub const Fd = struct {
         _ = self.ref();
         defer self.unref();
 
-        if (self.read_frame) |frame|
+        if (self.read_frame) |frame| {
+            self.read_frame = null;
             co.do_resume(frame);
+        }
 
-        if (self.write_frame) |frame|
+        if (self.write_frame) |frame| {
+            self.write_frame = null;
             co.do_resume(frame);
-
-        assert(self.read_frame == null);
-        assert(self.write_frame == null);
+        }
     }
 
     /// return `true` if canceled and set errno to `ECANCELED`
@@ -277,15 +278,18 @@ fn ev_del(self: *EvLoop, fdobj: *const Fd) bool {
 // ======================================================================
 
 fn set_frame(fdobj: *Fd, comptime field_name: []const u8, frame: anyframe) void {
-    assert(!fdobj.canceled);
+    if (fdobj.canceled)
+        return;
     assert(@field(fdobj, field_name) == null);
     @field(fdobj, field_name) = frame;
 }
 
 /// `frame` used for assert() check
 fn unset_frame(fdobj: *Fd, comptime field_name: []const u8, frame: anyframe) void {
-    assert(@field(fdobj, field_name) == frame);
-    @field(fdobj, field_name) = null;
+    // If cancel() already cleared the frame, skip quietly.
+    if (@field(fdobj, field_name) == frame) {
+        @field(fdobj, field_name) = null;
+    }
 }
 
 const EvType = enum {

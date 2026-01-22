@@ -157,8 +157,9 @@ pub fn module_init() void {
 }
 
 pub fn check_timeout(timer: *EvLoop.Timer) void {
-    var it = _session_list.iterator();
-    while (it.next()) |node| {
+    var node = _session_list.head();
+    while (node != &_session_list) {
+        const next = node.next; // safe iteration even if current gets unlinked/freed
         const session_node = SessionNode.from(node);
         switch (session_node.type) {
             .udp => {
@@ -176,12 +177,14 @@ pub fn check_timeout(timer: *EvLoop.Timer) void {
                     break;
             },
         }
+        node = next;
     }
 }
 
 const SessionNode = struct {
     type: enum { udp, tcp }, // `struct UDP` or `struct TCP`
     node: Node = undefined, // _session_list node
+    linked: bool = false,
 
     pub fn from(node: *Node) *SessionNode {
         return @fieldParentPtr(SessionNode, "node", node);
@@ -198,14 +201,19 @@ const SessionNode = struct {
     }
 
     pub fn on_work(self: *SessionNode, from_idle_state: bool) void {
-        if (from_idle_state)
-            _session_list.link_to_tail(&self.node)
-        else
+        if (from_idle_state or !self.linked) {
+            _session_list.link_to_tail(&self.node);
+            self.linked = true;
+        } else {
             _session_list.move_to_tail(&self.node);
+        }
     }
 
     pub fn on_idle(self: *SessionNode) void {
+        if (!self.linked)
+            return;
         self.node.unlink();
+        self.linked = false;
     }
 };
 
@@ -217,6 +225,8 @@ const UDP = struct {
     upstream: *Upstream,
     fdobj: *EvLoop.Fd,
     proxy_fdobj: ?*EvLoop.Fd = null, // socks5 tcp control channel (UDP ASSOCIATE)
+    fd_canceled: bool = false,
+    proxy_fd_canceled: bool = false,
     query_list: std.AutoHashMapUnmanaged(u16, u64) = .{}, // outstanding queries (qid => sent_at ms)
     create_time: u64,
     query_time: u64 = undefined, // last query time
@@ -261,9 +271,14 @@ const UDP = struct {
             self.closing = true;
             if (self.upstream.session_eql(self))
                 self.upstream.session = null;
-            self.fdobj.cancel();
-            if (self.proxy_fdobj) |pfdobj|
+            if (!self.fd_canceled) {
+                self.fdobj.cancel();
+                self.fd_canceled = true;
+            }
+            if (self.proxy_fdobj) |pfdobj| if (!self.proxy_fd_canceled) {
                 pfdobj.cancel();
+                self.proxy_fd_canceled = true;
+            };
             return;
         }
 
@@ -273,23 +288,22 @@ const UDP = struct {
             qmsg.unref();
         self.proxy_pending.clearAndFree(g.allocator);
 
-        if (!self.is_idle())
-            self.session_node.on_idle();
+        self.session_node.on_idle();
 
         if (self.upstream.session_eql(self))
             self.upstream.session = null;
 
-        self.fdobj.cancel();
-        self.fdobj.free();
-
-        if (self.proxy_fdobj) |pfdobj| {
-            pfdobj.cancel();
-            pfdobj.free();
+        if (!self.fd_canceled) {
+            self.fdobj.cancel();
+            self.fd_canceled = true;
         }
 
-        self.query_list.clearAndFree(g.allocator);
+        if (self.proxy_fdobj) |pfdobj| if (!self.proxy_fd_canceled) {
+            pfdobj.cancel();
+            self.proxy_fd_canceled = true;
+        };
 
-        g.allocator.destroy(self);
+        self.query_list.clearAndFree(g.allocator);
     }
 
     pub fn get_deadline(self: *const UDP) u64 {
@@ -446,7 +460,6 @@ const UDP = struct {
         var ok = false;
         defer if (!ok) {
             pfdobj.cancel();
-            pfdobj.free();
         };
 
         g.evloop.connect(pfdobj, &proxy_addr) orelse {
@@ -726,6 +739,7 @@ const TCP = struct {
     tls: TLS_ = .{}, // tls connection (DoT)
     send_list: MsgQueue = .{}, // qmsg to be sent
     ack_list: std.AutoHashMapUnmanaged(u16, *RcMsg) = .{}, // qmsg to be ack
+    fd_canceled: bool = false,
     create_time: u64, // last connect time
     query_time: u64 = undefined, // last query time
     query_count: u16 = 0, // total query count
@@ -853,26 +867,26 @@ const TCP = struct {
             if (self.upstream.session_eql(self))
                 self.upstream.session = null;
             self.send_list.cancel_wait();
-            if (self.fdobj) |fdobj|
+            if (self.fdobj) |fdobj| if (!self.fd_canceled) {
                 fdobj.cancel();
+                self.fd_canceled = true;
+            };
             return;
         }
 
         self.flags.freed = true;
 
-        if (!self.is_idle())
-            self.session_node.on_idle();
+        self.session_node.on_idle();
 
         if (self.upstream.session_eql(self))
             self.upstream.session = null;
 
         self.send_list.cancel_wait();
 
-        if (self.fdobj) |fdobj| {
+        if (self.fdobj) |fdobj| if (!self.fd_canceled) {
             fdobj.cancel();
-            fdobj.free();
-            self.fdobj = null;
-        }
+            self.fd_canceled = true;
+        };
 
         if (has_tls)
             self.tls.on_close();
@@ -880,8 +894,6 @@ const TCP = struct {
         self.send_list.clear();
         self.clear_ack_list(.unref);
         self.ack_list.clearAndFree(g.allocator);
-
-        g.allocator.destroy(self);
     }
 
     pub fn get_deadline(self: *const TCP) u64 {
@@ -989,8 +1001,10 @@ const TCP = struct {
         if (self.active > 1 or self.flags.in_sender) {
             self.flags.stop_requested = true;
             self.send_list.cancel_wait();
-            if (self.fdobj) |fdobj|
+            if (self.fdobj) |fdobj| if (!self.fd_canceled) {
                 fdobj.cancel();
+                self.fd_canceled = true;
+            };
             return;
         }
 
@@ -1006,9 +1020,13 @@ const TCP = struct {
             self.send_list.cancel_wait();
 
             if (self.fdobj) |fdobj| {
-                fdobj.cancel();
-                fdobj.free();
+                if (!self.fd_canceled) {
+                    fdobj.cancel();
+                    self.fd_canceled = true;
+                }
+                // tear down stale fd before any restart to avoid stale frame assertions
                 self.fdobj = null;
+                self.fd_canceled = false;
             }
 
             if (has_tls)

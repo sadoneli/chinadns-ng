@@ -134,16 +134,36 @@ pub fn load(data: *[]const u8) ?*CacheMsg {
         return null;
     }
 
-    const h: *align(1) const Header = std.mem.bytesAsValue(Header, data.*[0..header_len]);
+    const h: Header = std.mem.bytesToValue(Header, data.*[0..header_len]);
     if (data.len < header_len + h.msg_len) {
         log.warn(src, "len:%zu < header_len:%zu + msg_len:%u", .{ data.len, header_len, cc.to_uint(h.msg_len) });
         return null;
     }
 
-    // TODO: data validation ?
-    const in_msg = data.*[header_len .. header_len + h.msg_len];
+    const qnamelen = cc.to_int(h.qnamelen);
+    if (qnamelen <= 0 or qnamelen > c.DNS_NAME_MAXLEN) {
+        log.warn(src, "invalid qnamelen:%d", .{ qnamelen });
+        return null;
+    }
 
-    const cache_msg = new(in_msg, h.qnamelen, h.ttl, h.hashv);
+    const min_msg_len = dns.header_len() + dns.question_len(qnamelen);
+    const max_msg_len = cc.to_uint(c.DNS_MSG_MAXSIZE);
+    if (h.msg_len < min_msg_len or h.msg_len > max_msg_len) {
+        log.warn(
+            src,
+            "invalid msg_len:%u (min:%u max:%u)",
+            .{ cc.to_uint(h.msg_len), cc.to_uint(min_msg_len), max_msg_len },
+        );
+        return null;
+    }
+
+    const in_msg = data.*[header_len .. header_len + h.msg_len];
+    if (dns.question(in_msg, qnamelen).len == 0) {
+        log.warn(src, "invalid question (qnamelen:%d msg_len:%u)", .{ qnamelen, cc.to_uint(h.msg_len) });
+        return null;
+    }
+
+    const cache_msg = new(in_msg, qnamelen, h.ttl, h.hashv);
     cache_msg.update_time = @intCast(c.time_t, h.update_time);
     cache_msg.ttl_r = h.ttl_r;
     cache_msg.added_ip = false;
