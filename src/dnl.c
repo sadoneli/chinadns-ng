@@ -34,7 +34,7 @@ struct name {
     uint hashv;
     u8 namelen;
     char name[];
-} __attribute__((packed));
+};
 
 /* see the `NAMEADDR_BIT` */
 #define BUCKET_FREE 0 /* free */
@@ -98,8 +98,12 @@ static u32 alloc(u32 sz, u32 align) {
 #define ptr_name(addr) ((struct name *)ptr(addr))
 #define ptr_bucket(addr) ((struct bucket *)ptr(addr))
 
+static inline u32 name_allocsz(u8 namelen) {
+    return align_to((u32)sizeof(struct name) + namelen, (u32)__alignof__(struct name));
+}
+
 #define alloc_name(namelen) \
-    alloc(sizeof(struct name) + (namelen), __alignof__(struct name))
+    alloc(name_allocsz(namelen), __alignof__(struct name))
 
 #define alloc_bucket(n) \
     alloc(sizeof(struct bucket) * (n), __alignof__(struct bucket))
@@ -110,7 +114,7 @@ static u32 alloc(u32 sz, u32 align) {
     (ptr_name(nameaddr)->hashv)
 
 #define get_namesz(nameaddr) \
-    (sizeof(struct name) + ptr_name(nameaddr)->namelen)
+    name_allocsz(ptr_name(nameaddr)->namelen)
 
 static u32 add_name(const char *noalias name, u8 tag) {
     u8 namelen = strlen(name);
@@ -585,7 +589,8 @@ bool dnl_is_empty(void) {
 u8 dnl_get_tag(const char *noalias name, int namelen, u8 default_tag) {
     assert(!dnl_is_null());
 
-    assert(namelen > 0);
+    if (namelen <= 0 || namelen > DNS_NAME_MAXLEN)
+        return default_tag;
     assert((u8)namelen == namelen);
 
     const char *noalias suffix_array[MAX_NAME_LEVEL];

@@ -45,6 +45,11 @@ pub fn add(ascii_domain: []const u8) ?void {
 pub fn is_ignored(rmsg: []const u8, qnamelen: c_int) bool {
     if (_ignored_domains.count() == 0)
         return false;
+    if (qnamelen <= 0)
+        return true;
+    const min_len = @as(usize, dns.header_len()) + dns.question_len(qnamelen);
+    if (min_len > rmsg.len)
+        return true;
 
     var domains: [8][*]const u8 = undefined;
     var domain_end: [*]const u8 = undefined;

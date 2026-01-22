@@ -16,7 +16,13 @@ pub inline fn question_len(qnamelen: c_int) u16 {
 }
 
 pub inline fn question(msg: []const u8, qnamelen: c_int) []const u8 {
-    return msg[header_len() .. header_len() + question_len(qnamelen)];
+    if (qnamelen <= 0)
+        return msg[0..0];
+    const qlen = question_len(qnamelen);
+    const start = header_len();
+    if (start + qlen > msg.len)
+        return msg[0..0];
+    return msg[start .. start + qlen];
 }
 
 pub inline fn get_id(msg: []const u8) c.be16 {
@@ -41,7 +47,13 @@ pub inline fn get_rcode(msg: []const u8) u8 {
 
 /// null label (root domain) not included
 pub inline fn get_qname(msg: []const u8, qnamelen: c_int) []const u8 {
-    return msg[header_len() .. header_len() + cc.to_usize(qnamelen) - 1];
+    if (qnamelen <= 1)
+        return msg[0..0];
+    const start = header_len();
+    const end = start + cc.to_usize(qnamelen) - 1;
+    if (end > msg.len)
+        return msg[0..0];
+    return msg[start..end];
 }
 
 pub inline fn is_tc(msg: []const u8) bool {
@@ -56,6 +68,11 @@ pub inline fn is_good(msg: []const u8) bool {
 pub inline fn truncate(msg: []const u8) []u8 {
     const res_msg = cc.static_buf(c.DNS_QMSG_MAXSIZE);
     const len = c.dns_truncate(msg.ptr, cc.to_isize(msg.len), res_msg.ptr);
+    if (len == 0) {
+        const cap = std.math.min(msg.len, res_msg.len);
+        @memcpy(res_msg[0..cap].ptr, msg.ptr, cap);
+        return res_msg[0..cap];
+    }
     return res_msg[0..len];
 }
 

@@ -19,7 +19,10 @@ pub fn get(msg: []const u8, qnamelen: c_int) ?bool {
     if (_map.count() == 0)
         return null;
 
-    return _map.get(dns.get_qname(msg, qnamelen));
+    const qname = dns.get_qname(msg, qnamelen);
+    if (qname.len == 0)
+        return null;
+    return _map.get(qname);
 }
 
 /// tag:none && has_china_path && has_trust_path
@@ -28,6 +31,8 @@ pub fn add(msg: []const u8, qnamelen: c_int, is_china_domain: bool) void {
         return;
 
     const qname = dns.get_qname(msg, qnamelen);
+    if (qname.len == 0)
+        return;
     const res = _map.getOrPut(g.allocator, qname) catch unreachable;
 
     if (!res.found_existing)

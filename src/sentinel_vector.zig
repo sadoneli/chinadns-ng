@@ -31,7 +31,10 @@ pub fn SentinelVector(comptime T: type, comptime sentinel: T) type {
         /// end with sentinel
         pub fn resize(self: *Self, n_items: usize) void {
             if (n_items + 1 > self.capacity) {
-                const new_mem = g.allocator.realloc(self.mem(), n_items + 1) catch unreachable;
+                const new_mem = if (self.capacity == 0)
+                    g.allocator.alloc(T, n_items + 1) catch unreachable
+                else
+                    g.allocator.realloc(self.mem(), n_items + 1) catch unreachable;
                 self.set_mem(new_mem);
             }
             self.items.len = n_items;

@@ -61,32 +61,47 @@ static bool decode_name(char *noalias out, const char *noalias src, int len) {
         return true;
     }
 
-    /* ignore last byte: src="\3www\6google\3com" */
-    /* ignore first byte: out="www\6google\3com\0" */
-    memcpy(out, src + 1, --len);
+    int out_len = 0;
+    const ubyte *p = (const ubyte *)src;
 
-    /* foreach label (len:1byte | label) */
-    for (int first = 1; len >= 2;) {
-        if (first) first = 0; else *out++ = '.';
-        int label_len = *(const ubyte *)src++; --len;
-        unlikely_if (label_len < 1 || label_len > DNS_NAME_LABEL_MAXLEN) {
-            // log_error("label length is out of range: %d [1, %d]", label_len, DNS_NAME_LABEL_MAXLEN);
-            return false;
+    while (len > 0) {
+        int label_len = *p++;
+        --len;
+
+        if (label_len == 0) {
+            if (out_len == 0) {
+                out[0] = '.';
+                out[1] = '\0';
+                return true;
+            }
+            break;
         }
-        unlikely_if (label_len > len) {
-            // log_error("label length is greater than remaining length: %d > %d", label_len, len);
+
+        unlikely_if (label_len < 1 || label_len > DNS_NAME_LABEL_MAXLEN)
             return false;
+
+        unlikely_if (label_len > len)
+            return false;
+
+        if (out_len > 0) {
+            unlikely_if (out_len + 1 > DNS_NAME_MAXLEN)
+                return false;
+            out[out_len++] = '.';
         }
-        src += label_len;
+
+        unlikely_if (out_len + label_len > DNS_NAME_MAXLEN)
+            return false;
+
+        memcpy(out + out_len, p, label_len);
+        out_len += label_len;
+        p += label_len;
         len -= label_len;
-        out += label_len;
     }
 
-    unlikely_if (len != 0) {
-        // log_error("name format error, remaining length: %d", len);
+    unlikely_if (len != 0)
         return false;
-    }
 
+    out[out_len] = '\0';
     return true;
 }
 
@@ -333,19 +348,42 @@ bool dns_is_good(const void *noalias msg) {
 }
 
 static int get_qnamelen(const void *noalias msg, ssize_t len) {
+    if (len <= (ssize_t)sizeof(struct dns_header))
+        return 0;
     msg += sizeof(struct dns_header);
     len -= sizeof(struct dns_header);
-    assert(len > 0);
+    if (len <= 0)
+        return 0;
     const void *p = memchr(msg, 0, len);
-    assert(p);
-    return p + 1 - msg;
+    if (!p)
+        return 0;
+    int qnamelen = p + 1 - msg;
+    if (qnamelen < DNS_NAME_WIRE_MINLEN || qnamelen > DNS_NAME_WIRE_MAXLEN)
+        return 0;
+    return qnamelen;
 }
 
 u16 dns_truncate(const void *noalias msg, ssize_t len, void *noalias out) {
     int qnamelen = get_qnamelen(msg, len);
+    if (qnamelen <= 0 || len < (ssize_t)msg_minlen(qnamelen)) {
+        if (len < (ssize_t)sizeof(struct dns_header))
+            return 0;
+        memcpy(out, msg, sizeof(struct dns_header));
+        struct dns_header *h = out;
+        h->qr = DNS_QR_REPLY;
+        h->ra = 1;
+        h->rcode = DNS_RCODE_NOERROR;
+        h->answer_count = 0;
+        h->authority_count = 0;
+        h->additional_count = 0;
+        h->tc = 1;
+        return sizeof(struct dns_header);
+    }
+
     memcpy(out, msg, msg_minlen(qnamelen));
+    u16 newlen = dns_empty_reply(out, qnamelen);
     cast(struct dns_header *, out)->tc = 1;
-    return dns_empty_reply(out, qnamelen);
+    return newlen;
 }
 
 u16 dns_empty_reply(void *noalias msg, int qnamelen) {

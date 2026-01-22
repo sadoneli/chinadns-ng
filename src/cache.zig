@@ -137,6 +137,8 @@ pub fn get(
         return null;
 
     const question = dns.question(qmsg, qnamelen);
+    if (question.len == 0)
+        return null;
     const hashv = cc.calc_hashv(question);
     const cache_msg = map.get(question, hashv) orelse return null;
 
@@ -178,6 +180,8 @@ pub fn add(msg: []u8, qnamelen: c_int, p_ttl: *i32) bool {
 
     const cache_msg = b: {
         const question = dns.question(msg, qnamelen);
+        if (question.len == 0)
+            return false;
         const hashv = cc.calc_hashv(question);
         if (map.get(question, hashv)) |old| {
             // avoid duplicate add
