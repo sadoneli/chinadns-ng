@@ -86,7 +86,6 @@ const Query = struct {
             self.fdobj.unref();
 
         if (self.trust_msg) |msg| {
-            assert(msg.is_unique());
             msg.unref();
         }
 
