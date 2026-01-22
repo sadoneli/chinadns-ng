@@ -16,7 +16,8 @@ pub inline fn ref(self: *Rc) void {
 
 /// return the updated ref_count
 pub inline fn unref(self: *Rc) u32 {
-    assert(self.ref_count > 0);
+    if (self.ref_count == 0)
+        return 0;
     self.ref_count -= 1;
     return self.ref_count;
 }

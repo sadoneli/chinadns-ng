@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 
 void sig_register(int sig, sighandler_t handler) {
@@ -43,26 +44,20 @@ uint calc_hashv(const void *ptr, size_t len) {
 }
 
 bool has_aes(void) {
-    bool found = false;
-
-    FILE *f = fopen("/proc/cpuinfo", "r");
-    if (!f) goto out;
-
-    char buf[10];
-    while (fscanf(f, "%9s", buf) > 0) {
-        if (strstr(buf, "aes")) {
-            found = true;
-            break;
-        }
-    }
-
-out:
-    if (f) fclose(f);
-    return found;
+    return false;
 }
 
 u64 monotime(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (u64)t.tv_sec * 1000 + (u64)t.tv_nsec / 1000000;
+}
+
+int set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0)
+        return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+    return 0;
 }

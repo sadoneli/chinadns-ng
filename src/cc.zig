@@ -329,6 +329,10 @@ pub inline fn setvbuf(file: *FILE, buffer: ?[*]u8, mode: c_int, size: usize) ?vo
     return if (raw.setvbuf(file, buffer, mode, size) != 0) null;
 }
 
+pub inline fn set_nonblock(fd: c_int) ?void {
+    return if (c.set_nonblock(fd) == 0) {} else null;
+}
+
 // ==============================================================
 
 /// unix timestamp in seconds
@@ -592,7 +596,7 @@ pub inline fn SIG_IGN() sighandler_t {
 
 // ==============================================================
 
-pub const IpStrBuf = [c.INET6_ADDRSTRLEN - 1:0]u8;
+pub const IpStrBuf = [c.INET6_ADDRSTRLEN:0]u8;
 pub const IpNetBuf = [c.IPV6_LEN]u8;
 
 pub fn ip_to_net(ip: ConstStr, buf: *IpNetBuf) ?[]u8 {
@@ -823,7 +827,7 @@ pub fn SSL_CTX_new() *c.WOLFSSL_CTX {
     // openssl has a separate API for tls13, but wolfssl only has one
     const chacha20 = "TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
     const aes128gcm = "TLS_AES_128_GCM_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256";
-    const cipher_list = if (c.has_aes()) aes128gcm ++ ":" ++ chacha20 else chacha20 ++ ":" ++ aes128gcm;
+    const cipher_list = chacha20 ++ ":" ++ aes128gcm;
     assert(c.wolfSSL_CTX_set_cipher_list(ctx, cipher_list) == 1);
 
     // options

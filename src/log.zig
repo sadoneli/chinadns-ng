@@ -1,4 +1,5 @@
 const std = @import("std");
+const c = @import("c.zig");
 const cc = @import("cc.zig");
 const SourceLocation = std.builtin.SourceLocation;
 
@@ -47,15 +48,18 @@ pub fn srcinfo(comptime src: SourceLocation) [:0]const u8 {
         const i = std.mem.indexOfScalar(u8, src.fn_name, '.') orelse -1;
         break :b src.fn_name[i + 1 ..];
     };
-    return std.fmt.comptimePrint("[{s}:{d} {s}]", .{ filename, src.line, fn_name });
+    const src_info = std.fmt.comptimePrint("[{s}:{d} {s}]\x00", .{ filename, src.line, fn_name });
+    return src_info[0 .. src_info.len - 1 :0];
 }
 
 fn log_write(comptime level: Level, comptime src: SourceLocation, comptime in_fmt: [:0]const u8, in_args: anytype) void {
+    var buf: [2048]u8 = undefined;
     const timefmt = "%d-%02d-%02d %02d:%02d:%02d";
     const fmt = "\x1b[" ++ level.color() ++ ";1m" ++ timefmt ++ " " ++ level.desc() ++ "\x1b[0m \x1b[1m%s\x1b[0m" ++ " " ++ in_fmt ++ "\n";
     const t = time();
     const args = .{ t[0], t[1], t[2], t[3], t[4], t[5], comptime srcinfo(src).ptr } ++ in_args;
-    @call(.{}, cc.printf, .{ fmt, args });
+    const line = cc.snprintf(&buf, fmt, args);
+    _ = cc.write(c.STDOUT_FILENO, line);
 }
 
 pub fn debug(comptime src: SourceLocation, comptime fmt: [:0]const u8, args: anytype) void {

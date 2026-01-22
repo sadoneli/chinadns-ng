@@ -139,6 +139,8 @@ pub fn main() u8 {
     _ = cc.signal(c.SIGPIPE, cc.SIG_IGN());
 
     _ = cc.setvbuf(cc.stdout, null, c._IOLBF, 256);
+    _ = cc.set_nonblock(c.STDOUT_FILENO);
+    _ = cc.set_nonblock(c.STDERR_FILENO);
 
     // setting default values for TZ
     _ = cc.setenv("TZ", ":/etc/localtime", false);

@@ -137,3 +137,5 @@ uint calc_hashv(const void *ptr, size_t len);
 bool has_aes(void);
 
 u64 monotime(void);
+
+int set_nonblock(int fd);
