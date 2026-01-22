@@ -7,7 +7,7 @@ const Step = std.build.Step;
 const LibExeObjStep = std.build.LibExeObjStep;
 const OptionsStep = std.build.OptionsStep;
 
-const chinadns_version = "2026.01.18";
+const chinadns_version = "2026.01.21-dev";
 
 var _b: *Builder = undefined;
 
@@ -861,6 +861,9 @@ fn configure() void {
         link_obj_mimalloc(exe);
 
     link_obj_chinadns(exe);
+
+    if (_target.getOsTag() != .windows)
+        exe.linkSystemLibrary("pthread");
 
     // link wolfssl library
     if (_enable_wolfssl) {

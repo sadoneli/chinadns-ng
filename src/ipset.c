@@ -12,6 +12,7 @@
 #include <linux/netlink.h>
 #include <arpa/inet.h>
 #include <assert.h>
+#include <pthread.h>
 
 /* linux/netfilter/nfnetlink.h */
 struct nfgenmsg {
@@ -249,6 +250,8 @@ static void *s_buf_res;
 static struct header s_batch_begin;
 static struct header s_batch_end;
 
+static pthread_mutex_t s_ipset_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* ====================================================== */
 
 struct ipset_testctx {
@@ -282,6 +285,15 @@ static void add_ip_nftset(const struct ipset_addctx *noalias ctx, bool v4, const
 static int (*end_add_ip)(const struct ipset_addctx *noalias ctx);
 static int end_add_ip_ipset(const struct ipset_addctx *noalias ctx);
 static int end_add_ip_nftset(const struct ipset_addctx *noalias ctx);
+static void ipset_end_add_ip_locked(struct ipset_addctx *noalias ctx);
+
+static void ipset_lock(void) {
+    pthread_mutex_lock(&s_ipset_lock);
+}
+
+static void ipset_unlock(void) {
+    pthread_mutex_unlock(&s_ipset_lock);
+}
 
 /* ====================================================== */
 
@@ -541,6 +553,8 @@ err:
 static bool init(const char *noalias name46) {
     bool is_ipset = !strchr(name46, '@');
 
+    ipset_lock();
+
     /* already initialized ? */
     if (s_sock >= 0) {
         /* the backend must be the same */
@@ -548,8 +562,10 @@ static bool init(const char *noalias name46) {
         unlikely_if (is_ipset != is_ipset_backend) {
             log_error("mixing two backends is not allowed");
             log_error("backend: %s, setnames: %s", is_ipset_backend ? "ipset" : "nftset", name46);
+            ipset_unlock();
             exit(1);
         }
+        ipset_unlock();
         return is_ipset;
     }
 
@@ -583,6 +599,7 @@ static bool init(const char *noalias name46) {
 
     // log_info("current backend: %s", is_ipset ? "ipset" : "nftset");
 
+    ipset_unlock();
     return is_ipset;
 }
 
@@ -723,21 +740,32 @@ bool ipset_test_ip(const struct ipset_testctx *noalias ctx, const void *noalias 
     struct nlmsghdr *msg = t_msg(ctx, v4);
     if (!msg) return false;
 
+    ipset_lock();
+
     memcpy(t_ip(ctx, v4), ip, iplen(v4));
 
     /* send request */
     set_iov(&s_iov[0], msg, msg->nlmsg_len);
     set_MSGHDR(&s_msgv[0].msg_hdr, &s_iov[0], 1, NULL, 0);
-    unlikely_if (send_req(1) < 0) return false; /* send failed */
+    unlikely_if (send_req(1) < 0) {
+        ipset_unlock();
+        return false; /* send failed */
+    }
 
     /* recv response */
     set_iov(&s_iov[0], s_buf_res, BUFSZ_RES);
     switch (recv_res(1, false)) {
         case 0: /* no msg */
+            ipset_unlock();
             return true;
         case 1:
-            return test_res(s_buf_res);
+            {
+                bool ok = test_res(s_buf_res);
+                ipset_unlock();
+                return ok;
+            }
         default: /* error occurs */
+            ipset_unlock();
             return false;
     }
 }
@@ -773,19 +801,26 @@ void ipset_add_ip(struct ipset_addctx *noalias ctx, const void *noalias ip, bool
     struct nlmsghdr *msg = a_msg(ctx, v4);
     if (!msg) return;
 
-    if (ipset_blacklist && in_blacklist(ip, v4)) return;
+    ipset_lock();
+
+    if (ipset_blacklist && in_blacklist(ip, v4)) {
+        ipset_unlock();
+        return;
+    }
 
     int n = a_ipcnt(ctx, v4);
     if (n <= 0)
         msg->nlmsg_len = a_baselen(ctx, v4);
     else if (n >= IP_N) {
-        ipset_end_add_ip(ctx);
+        ipset_end_add_ip_locked(ctx);
         assert(a_ipcnt(ctx, v4) == 0);
         msg->nlmsg_len = a_baselen(ctx, v4);
     }
 
     add_ip(ctx, v4, ip);
     ++a_ipcnt(ctx, v4);
+
+    ipset_unlock();
 }
 
 /* ======================== end-add-ip ======================== */
@@ -978,7 +1013,7 @@ static int end_add_ip_nftset(const struct ipset_addctx *noalias ctx) {
 
 /* ====================================================== */
 
-void ipset_end_add_ip(struct ipset_addctx *noalias ctx) {
+static void ipset_end_add_ip_locked(struct ipset_addctx *noalias ctx) {
     /*
       current dns servers do not carry both A and AAAA answers, but they may in the future.
       see: https://datatracker.ietf.org/doc/html/draft-vavrusa-dnsop-aaaa-for-free-00
@@ -1006,4 +1041,10 @@ void ipset_end_add_ip(struct ipset_addctx *noalias ctx) {
         int errcode = nlmsg_errcode(nlmsg);
         log_warning("error when adding ip: (%d) %s", errcode, ipset_strerror(errcode));
     }
+}
+
+void ipset_end_add_ip(struct ipset_addctx *noalias ctx) {
+    ipset_lock();
+    ipset_end_add_ip_locked(ctx);
+    ipset_unlock();
 }

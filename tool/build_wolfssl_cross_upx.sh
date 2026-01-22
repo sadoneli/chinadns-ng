@@ -15,10 +15,8 @@ if [[ -z "$ZIG_BIN" ]]; then
   fi
 fi
 
-UPX_502_BIN="${UPX_502_BIN:-upx-5.0.2}"
 UPX_424_BIN="${UPX_424_BIN:-upx-4.2.4}"
 
-command -v "$UPX_502_BIN" >/dev/null 2>&1 || { echo "missing $UPX_502_BIN"; exit 1; }
 command -v "$UPX_424_BIN" >/dev/null 2>&1 || { echo "missing $UPX_424_BIN"; exit 1; }
 
 OUT_AARCH64="chinadns-ng+wolfssl@aarch64-linux-musl@generic+v8a@fast+lto"
@@ -28,40 +26,61 @@ OUT_ARM_V5TE="chinadns-ng+wolfssl@arm-linux-musleabi@generic+v5te+soft_float@fas
 build_one() {
   local target="$1"
   local cpu="$2"
-  "$ZIG_BIN" build -Dwolfssl=true -Dtarget="$target" -Dcpu="$cpu" -Dmode=fast -Dlto=true -Dstrip=true
+  local out="$3"
+  "$ZIG_BIN" build \
+    -Dwolfssl=true \
+    -Dtarget="$target" \
+    -Dcpu="$cpu" \
+    -Dmode=fast \
+    -Dlto=true \
+    -Dstrip=true
+  cp -f "zig-out/bin/$out" "dist/$out"
+  chmod +x "dist/$out"
 }
 
 mkdir -p dist
 
 echo "[build] $OUT_AARCH64"
-build_one aarch64-linux-musl 'generic+v8a'
-cp -f "zig-out/bin/$OUT_AARCH64" "dist/$OUT_AARCH64"
-chmod +x "dist/$OUT_AARCH64"
+build_one aarch64-linux-musl 'generic+v8a' "$OUT_AARCH64"
 
 echo "[build] $OUT_ARM_V7A"
-build_one arm-linux-musleabi 'generic+v7a'
-cp -f "zig-out/bin/$OUT_ARM_V7A" "dist/$OUT_ARM_V7A"
-chmod +x "dist/$OUT_ARM_V7A"
+build_one arm-linux-musleabi 'generic+v7a' "$OUT_ARM_V7A"
 
 echo "[build] $OUT_ARM_V5TE"
-build_one arm-linux-musleabi 'generic+v5te+soft_float'
-cp -f "zig-out/bin/$OUT_ARM_V5TE" "dist/$OUT_ARM_V5TE"
-chmod +x "dist/$OUT_ARM_V5TE"
+build_one arm-linux-musleabi 'generic+v5te+soft_float' "$OUT_ARM_V5TE"
 
-echo "[upx] $OUT_ARM_V7A (upx-5.0.2)"
-"$UPX_502_BIN" --lzma --ultra-brute "dist/$OUT_ARM_V7A"
+OUT_AARCH64_UPX="${OUT_AARCH64}.upx"
+OUT_ARM_V7A_UPX="${OUT_ARM_V7A}.upx"
+OUT_ARM_V5TE_UPX="${OUT_ARM_V5TE}.upx"
 
-echo "[upx] $OUT_ARM_V5TE (upx-4.2.4)"
-"$UPX_424_BIN" --lzma --ultra-brute "dist/$OUT_ARM_V5TE"
+cp -f "dist/$OUT_AARCH64" "dist/$OUT_AARCH64_UPX"
+cp -f "dist/$OUT_ARM_V7A" "dist/$OUT_ARM_V7A_UPX"
+cp -f "dist/$OUT_ARM_V5TE" "dist/$OUT_ARM_V5TE_UPX"
 
-echo "[upx] $OUT_AARCH64 (upx-5.0.2)"
-"$UPX_502_BIN" --lzma --ultra-brute "dist/$OUT_AARCH64"
+echo "[upx] $OUT_ARM_V7A_UPX (upx-4.2.4)"
+"$UPX_424_BIN" --best "dist/$OUT_ARM_V7A_UPX"
+
+echo "[upx] $OUT_ARM_V5TE_UPX (upx-4.2.4)"
+"$UPX_424_BIN" --best "dist/$OUT_ARM_V5TE_UPX"
+
+echo "[upx] $OUT_AARCH64_UPX (upx-4.2.4)"
+"$UPX_424_BIN" --best "dist/$OUT_AARCH64_UPX"
 
 sha256sum \
   "dist/$OUT_AARCH64" \
   "dist/$OUT_ARM_V7A" \
   "dist/$OUT_ARM_V5TE" \
+  "dist/$OUT_AARCH64_UPX" \
+  "dist/$OUT_ARM_V7A_UPX" \
+  "dist/$OUT_ARM_V5TE_UPX" \
   > dist/SHA256SUMS
 
 echo "[done] outputs:"
-ls -la "dist/$OUT_AARCH64" "dist/$OUT_ARM_V7A" "dist/$OUT_ARM_V5TE" dist/SHA256SUMS
+ls -la \
+  "dist/$OUT_AARCH64" \
+  "dist/$OUT_ARM_V7A" \
+  "dist/$OUT_ARM_V5TE" \
+  "dist/$OUT_AARCH64_UPX" \
+  "dist/$OUT_ARM_V7A_UPX" \
+  "dist/$OUT_ARM_V5TE_UPX" \
+  dist/SHA256SUMS
