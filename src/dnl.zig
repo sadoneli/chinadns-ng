@@ -24,6 +24,12 @@ pub inline fn get_tag(name: [*]const u8, namelen: c_int) Tag {
         g.default_tag;
 }
 
+fn cstrSliceBounded(z: [*:0]const u8, max: usize) []const u8 {
+    var i: usize = 0;
+    while (i < max and z[i] != 0) : (i += 1) {}
+    return z[0..i];
+}
+
 fn readToken(reader: anytype, buf_z: []u8) !?usize {
     var i: usize = 0;
 
@@ -73,16 +79,26 @@ fn readToken(reader: anytype, buf_z: []u8) !?usize {
 /// Called from `src/dnl.c` when a domain list filename ends with `.gz`.
 /// Decompresses the gzip stream and feeds tokens into dnl's internal allocator.
 pub export fn dnl_load_list_gz(tag: u8, fname_z: [*:0]const u8, p_addr0: *u32, p_count: *u32) bool {
-    const path = std.mem.span(fname_z);
+    const path = cstrSliceBounded(fname_z, cc.to_usize(c.PATH_MAX));
     var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| {
-        log.warn(@src(), "failed to open gzip dnl '%.*s': %s", .{ @intCast(c_int, path.len), path.ptr, @errorName(err).ptr });
+        const err_name = @errorName(err);
+        log.warn(
+            @src(),
+            "failed to open gzip dnl '%.*s': %.*s",
+            .{ @intCast(c_int, path.len), path.ptr, @intCast(c_int, err_name.len), err_name.ptr },
+        );
         return false;
     };
     defer file.close();
 
     var br = std.io.bufferedReader(file.reader());
     var gz = std.compress.gzip.gzipStream(g.allocator, br.reader()) catch |err| {
-        log.warn(@src(), "failed to init gzip stream '%.*s': %s", .{ @intCast(c_int, path.len), path.ptr, @errorName(err).ptr });
+        const err_name = @errorName(err);
+        log.warn(
+            @src(),
+            "failed to init gzip stream '%.*s': %.*s",
+            .{ @intCast(c_int, path.len), path.ptr, @intCast(c_int, err_name.len), err_name.ptr },
+        );
         return false;
     };
     defer gz.deinit();
@@ -96,7 +112,12 @@ pub export fn dnl_load_list_gz(tag: u8, fname_z: [*:0]const u8, p_addr0: *u32, p
 
     while (true) {
         const tok_len = readToken(reader, buf[0..]) catch |err| {
-            log.warn(@src(), "failed to read gzip dnl '%.*s': %s", .{ @intCast(c_int, path.len), path.ptr, @errorName(err).ptr });
+            const err_name = @errorName(err);
+            log.warn(
+                @src(),
+                "failed to read gzip dnl '%.*s': %.*s",
+                .{ @intCast(c_int, path.len), path.ptr, @intCast(c_int, err_name.len), err_name.ptr },
+            );
             break;
         } orelse break;
 
