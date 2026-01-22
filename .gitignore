@@ -7,5 +7,6 @@ dist/
 dep/openssl-*
 dep/mimalloc-*
 dep/wolfssl-*
+test/
 tool/dns_cache_mgr
 tool/*.db
