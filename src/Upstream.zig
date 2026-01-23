@@ -1216,15 +1216,26 @@ const TCP = struct {
 
     /// `errmsg`: null means strerror(errno)
     fn on_error(self: *const TCP, op: cc.ConstStr, errmsg: ?cc.ConstStr) ?void {
-        const src = @src();
-
         if (self.fdobj.?.canceled)
             return null;
 
-        if (errmsg) |msg|
-            log.warn(src, "%s(%s) failed: %s", .{ op, self.upstream.url, msg })
-        else
-            log.warn(src, "%s(%s) failed: (%d) %m", .{ op, self.upstream.url, cc.errno() });
+        const src = @src();
+        // throttle repetitive errors to avoid log flooding
+        const now = g.evloop.time;
+        const suppress_window_ms: u64 = 1000;
+        const flush_every: u32 = 50;
+        var counter_ref = &g.proxy_error_counter;
+        var last_ref = &g.proxy_error_last_ms;
+
+        counter_ref.* +|= 1;
+        if (counter_ref.* == 1 or now - last_ref.* >= suppress_window_ms or (counter_ref.* % flush_every) == 0) {
+            last_ref.* = now;
+            if (errmsg) |msg|
+                log.warn(src, "%s(%s) failed: %s [cnt:%u]", .{ op, self.upstream.url, msg, cc.to_uint(counter_ref.*) })
+            else
+                log.warn(src, "%s(%s) failed: (%d) %m [cnt:%u]", .{ op, self.upstream.url, cc.errno(), cc.to_uint(counter_ref.*) });
+            counter_ref.* = 0;
+        }
 
         return null;
     }

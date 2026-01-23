@@ -101,6 +101,10 @@ pub const PROXY_PROTO_UDP: u8 = 1 << 2;
 pub const PROXY_PROTO_ALL: u8 = PROXY_PROTO_TCP | PROXY_PROTO_TLS | PROXY_PROTO_UDP;
 pub var proxy_proto_mask: u8 = PROXY_PROTO_ALL; // bitset for upstream proto
 
+// proxy error log throttling (shared counters)
+pub var proxy_error_counter: u32 = 0;
+pub var proxy_error_last_ms: u64 = 0;
+
 // proxy failure backoff (monotonic ms, from evloop.time)
 pub var proxy_backoff_until: u64 = 0;
 pub var proxy_backoff_step: u8 = 0;

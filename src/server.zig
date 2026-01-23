@@ -263,6 +263,9 @@ fn tcp_server(fd: c_int, p_src_addr: *const cc.SockAddr) void {
 
     const src = @src();
 
+    var warn_counter: usize = 0;
+    var warn_last_ms: u64 = 0;
+
     if (g.verbose()) log.info(src, "new connection:%d from %s#%u", .{ fd, &ip, cc.to_uint(port) });
     defer if (g.verbose()) log.info(src, "close connection:%d from %s#%u", .{ fd, &ip, cc.to_uint(port) });
 
@@ -275,7 +278,16 @@ fn tcp_server(fd: c_int, p_src_addr: *const cc.SockAddr) void {
             var len: u16 = undefined;
             g.evloop.read(fdobj, std.mem.asBytes(&len)) catch |err| switch (err) {
                 error.eof => return,
-                error.errno => break :e .{ .op = "read_len" },
+                error.errno => {
+                    warn_counter += 1;
+                    const now = g.evloop.time;
+                    if (warn_counter == 1 or now - warn_last_ms >= 1000) {
+                        warn_last_ms = now;
+                        log.warn(src, "read_len(fd:%d, %s#%u) failed: (%d) %m [cnt:%u]", .{ fd, &ip, cc.to_uint(port), cc.errno(), cc.to_uint(warn_counter) });
+                        warn_counter = 0;
+                    }
+                    break :e .{ .op = "read_len" };
+                },
             };
 
             len = cc.ntohs(len);
