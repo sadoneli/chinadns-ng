@@ -50,11 +50,12 @@ const help =
     \\ --hosts [path]                       load hosts file, default path is /etc/hosts
     \\ --dns-rr-ip <names>=<ips>            define local resource records of type A/AAAA
     \\ --cert-verify                        enable SSL certificate validation, default: no
-    \\ --ca-certs <path>                    CA certs path for SSL certificate validation
-    \\ --proxy-server <url>                 socks5 proxy for trust upstream dns (no auth)
-    \\ --proxy-group <tags>                 tag list to use proxy, default: gfw
-    \\ --no-ipset-blacklist                 add-ip: don't enable built-in ip blacklist
-    \\                                      blacklist: 127.0.0.0/8, 0.0.0.0/8, ::1, ::
+\\ --ca-certs <path>                    CA certs path for SSL certificate validation
+\\ --proxy-server <url>                 socks5 proxy for trust upstream dns (no auth)
+\\ --proxy-group <tags>                 tag list to use proxy, default: gfw
+\\ --proxy-protocol <list>              proxy only these upstream protos: tcp,tls,udp
+\\ --no-ipset-blacklist                 add-ip: don't enable built-in ip blacklist
+\\                                      blacklist: 127.0.0.0/8, 0.0.0.0/8, ::1, ::
     \\ -o, --timeout-sec <sec>              response timeout of upstream, default: 5
     \\ -p, --repeat-times <num>             num of packets to trustdns, default:1, max:5
     \\ -n, --noip-as-chnip                  allow no-ip reply from chinadns (tag:none)
@@ -152,6 +153,7 @@ const optdef_array = [_]OptDef{
     .{ .short = "",  .long = "ca-certs",           .value = .required, .optfn = opt_ca_certs,           },
     .{ .short = "",  .long = "proxy-server",       .value = .required, .optfn = opt_proxy_server,       },
     .{ .short = "",  .long = "proxy-group",        .value = .required, .optfn = opt_proxy_group,        },
+    .{ .short = "",  .long = "proxy-protocol",     .value = .required, .optfn = opt_proxy_protocol,     },
     .{ .short = "",  .long = "no-ipset-blacklist", .value = .no_value, .optfn = opt_no_ipset_blacklist, },
     .{ .short = "o", .long = "timeout-sec",        .value = .required, .optfn = opt_timeout_sec,        },
     .{ .short = "p", .long = "repeat-times",       .value = .required, .optfn = opt_repeat_times,       },
@@ -619,6 +621,35 @@ fn opt_proxy_group(in_value: ?[]const u8) void {
 
     // overwrite mode: last one wins
     g.proxy_group_mask = mask;
+}
+
+fn opt_proxy_protocol(in_value: ?[]const u8) void {
+    const src = @src();
+    const value = in_value.?;
+
+    var mask: u8 = 0;
+
+    var it = std.mem.split(u8, value, ",");
+    while (it.next()) |raw_name| {
+        const name = std.mem.trim(u8, raw_name, " \t\r");
+        if (name.len == 0)
+            invalid_optvalue(src, value);
+
+        if (std.mem.eql(u8, name, "tcp")) {
+            mask |= g.PROXY_PROTO_TCP;
+        } else if (std.mem.eql(u8, name, "tls")) {
+            mask |= g.PROXY_PROTO_TLS;
+        } else if (std.mem.eql(u8, name, "udp")) {
+            mask |= g.PROXY_PROTO_UDP;
+        } else {
+            invalid_optvalue(src, value);
+        }
+    }
+
+    if (mask == 0)
+        invalid_optvalue(src, value);
+
+    g.proxy_proto_mask = mask;
 }
 
 fn opt_no_ipset_blacklist(_: ?[]const u8) void {

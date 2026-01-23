@@ -22,6 +22,15 @@ fn use_proxy(upstream: *const Upstream) bool {
         return false;
     if (g.proxy_group_mask == 0)
         return false;
+    // protocol filter (default allow all unless overridden)
+    const proto_mask = switch (upstream.proto) {
+        .udp, .udpi => g.PROXY_PROTO_UDP,
+        .tcp, .tcpi => g.PROXY_PROTO_TCP,
+        .tls => g.PROXY_PROTO_TLS,
+        else => g.PROXY_PROTO_ALL,
+    };
+    if ((g.proxy_proto_mask & proto_mask) == 0)
+        return false;
     const tag_int = upstream.tag.int();
     if (tag_int >= 16)
         return false;

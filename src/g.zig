@@ -95,6 +95,11 @@ pub var ca_certs: DynStr = .{};
 pub var proxy_server: ?cc.ConstStr = null;
 pub var proxy_addr: ?cc.SockAddr = null;
 pub var proxy_group_mask: u16 = 0; // bitset: 1 << Tag.int()
+pub const PROXY_PROTO_TCP: u8 = 1 << 0;
+pub const PROXY_PROTO_TLS: u8 = 1 << 1;
+pub const PROXY_PROTO_UDP: u8 = 1 << 2;
+pub const PROXY_PROTO_ALL: u8 = PROXY_PROTO_TCP | PROXY_PROTO_TLS | PROXY_PROTO_UDP;
+pub var proxy_proto_mask: u8 = PROXY_PROTO_ALL; // bitset for upstream proto
 
 // proxy failure backoff (monotonic ms, from evloop.time)
 pub var proxy_backoff_until: u64 = 0;
