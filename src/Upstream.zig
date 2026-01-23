@@ -173,6 +173,10 @@ pub fn check_timeout(timer: *EvLoop.Timer) void {
         switch (session_node.type) {
             .udp => {
                 const session = session_node.udp();
+                if (session.is_idle()) {
+                    session.session_node.on_idle();
+                    break;
+                }
                 if (timer.check_deadline(session.get_deadline()))
                     session.free()
                 else
@@ -180,6 +184,10 @@ pub fn check_timeout(timer: *EvLoop.Timer) void {
             },
             .tcp => {
                 const session = session_node.tcp();
+                if (session.is_idle()) {
+                    session.session_node.on_idle();
+                    break;
+                }
                 if (timer.check_deadline(session.get_deadline()))
                     session.free()
                 else
@@ -1222,8 +1230,8 @@ const TCP = struct {
         const src = @src();
         // throttle repetitive errors to avoid log flooding
         const now = g.evloop.time;
-        const suppress_window_ms: u64 = 1000;
-        const flush_every: u32 = 50;
+        const suppress_window_ms: u64 = 5000;
+        const flush_every: u32 = 100;
         var counter_ref = &g.proxy_error_counter;
         var last_ref = &g.proxy_error_last_ms;
 

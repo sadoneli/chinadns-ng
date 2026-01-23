@@ -105,6 +105,14 @@ pub var proxy_proto_mask: u8 = PROXY_PROTO_ALL; // bitset for upstream proto
 pub var proxy_error_counter: u32 = 0;
 pub var proxy_error_last_ms: u64 = 0;
 
+// tcp server read error throttling
+pub var tcp_read_err_counter: u32 = 0;
+pub var tcp_read_err_last_ms: u64 = 0;
+
+// tcp accept error throttling
+pub var tcp_accept_err_counter: u32 = 0;
+pub var tcp_accept_err_last_ms: u64 = 0;
+
 // proxy failure backoff (monotonic ms, from evloop.time)
 pub var proxy_backoff_until: u64 = 0;
 pub var proxy_backoff_step: u8 = 0;
