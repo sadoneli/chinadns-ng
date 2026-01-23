@@ -20,12 +20,16 @@ len: u16, // msg len (0 means empty)
 const alignment = @alignOf(RcMsg);
 const header_len = @sizeOf(RcMsg);
 
+inline fn total_len(cap: u16) usize {
+    return header_len + @as(usize, cap);
+}
+
 fn header(bytes: []align(alignment) u8) *RcMsg {
     return std.mem.bytesAsValue(RcMsg, bytes[0..header_len]);
 }
 
 pub fn new(cap: u16) *RcMsg {
-    const bytes = g.allocator.alignedAlloc(u8, alignment, header_len + cap) catch unreachable;
+    const bytes = g.allocator.alignedAlloc(u8, alignment, total_len(cap)) catch unreachable;
     const self = header(bytes);
     self.* = .{
         .cap = cap,
@@ -40,7 +44,7 @@ pub fn realloc(self: *RcMsg, new_cap: u16) *RcMsg {
         const bytes = g.allocator.reallocAdvanced(
             self.mem(),
             alignment,
-            header_len + new_cap,
+            total_len(new_cap),
             .exact,
         ) catch unreachable;
         const new_self = header(bytes);
@@ -73,10 +77,10 @@ pub fn is_unique(self: *const RcMsg) bool {
     return self.rc.ref_count == 1;
 }
 
-fn mem(self: anytype) Bytes(@TypeOf(self), .slice) {
-    const P = Bytes(@TypeOf(self), .ptr);
-    return @ptrCast(P, self)[0 .. header_len + self.cap];
-}
+    fn mem(self: anytype) Bytes(@TypeOf(self), .slice) {
+        const P = Bytes(@TypeOf(self), .ptr);
+        return @ptrCast(P, self)[0 .. total_len(self.cap)];
+    }
 
 pub fn buf(self: anytype) Bytes(@TypeOf(self), .slice) {
     return self.mem()[header_len..];

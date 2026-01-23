@@ -314,11 +314,18 @@ const UDP = struct {
             self.fdobj.cancel();
             self.fd_canceled = true;
         }
+        // close fd to avoid leaks
+        self.fdobj.free();
 
         if (self.proxy_fdobj) |pfdobj| if (!self.proxy_fd_canceled) {
             pfdobj.cancel();
             self.proxy_fd_canceled = true;
         };
+        if (self.proxy_fdobj) |pfdobj| {
+            pfdobj.free();
+            self.proxy_fdobj = null;
+            self.proxy_fd_canceled = false;
+        }
 
         self.query_list.clearAndFree(g.allocator);
     }
@@ -904,6 +911,11 @@ const TCP = struct {
             fdobj.cancel();
             self.fd_canceled = true;
         };
+        if (self.fdobj) |fdobj| {
+            fdobj.free();
+            self.fdobj = null;
+            self.fd_canceled = false;
+        }
 
         if (has_tls)
             self.tls.on_close();
@@ -1042,6 +1054,7 @@ const TCP = struct {
                     self.fd_canceled = true;
                 }
                 // tear down stale fd before any restart to avoid stale frame assertions
+                fdobj.free();
                 self.fdobj = null;
                 self.fd_canceled = false;
             }
