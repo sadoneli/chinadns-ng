@@ -522,6 +522,21 @@ const QueryLog = struct {
 
 /// nosuspend
 fn on_query(qmsg: *RcMsg, fdobj: *EvLoop.Fd, src_addr: *const cc.SockAddr, in_qflags: Query.Flags) void {
+    // Global socket backoff: if we recently hit EMFILE, fail fast to protect CPU/fd.
+    if (g.evloop.time < g.socket_backoff_until) {
+        const msg = qmsg.msg();
+        var qnamelen: c_int = undefined;
+        if (dns.check_query(msg, null, &qnamelen)) {
+            const rmsg = dns.servfail_reply(msg, qnamelen);
+            send_reply(rmsg, fdobj, src_addr, switch (in_qflags.from) {
+                .udp => dns.get_bufsz(msg, qnamelen),
+                .tcp => cc.to_u16(c.DNS_MSG_MAXSIZE),
+                .local => unreachable,
+            }, dns.get_id(msg), in_qflags);
+        }
+        return;
+    }
+
     const msg = qmsg.msg();
     var qflags = in_qflags;
 
