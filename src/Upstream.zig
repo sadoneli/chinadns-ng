@@ -62,6 +62,8 @@ count: ParamValue, // max queries per session (0 means no limit)
 life: ParamValue, // max lifetime(sec) per session (0 means no limit)
 proto: Proto,
 tag: Tag,
+backoff_until: u64 = 0,
+backoff_step: u8 = 0,
 
 const ParamValue = u16;
 const DEFAULT_COUNT: ParamValue = 10;
@@ -154,6 +156,25 @@ fn get_session(self: *Upstream, comptime T: type) ?*T {
 
 fn session_eql(self: *const Upstream, in_session: ?*const anyopaque) bool {
     return self.session == in_session;
+}
+
+fn can_try(self: *const Upstream) bool {
+    return g.evloop.time >= self.backoff_until;
+}
+
+fn note_success(self: *Upstream) void {
+    self.backoff_until = 0;
+    self.backoff_step = 0;
+}
+
+fn note_fail(self: *Upstream) void {
+    if (self.backoff_step < 10)
+        self.backoff_step += 1;
+    const shift: u6 = @intCast(u6, if (self.backoff_step > 1) self.backoff_step - 1 else 0);
+    var delay: u64 = 200;
+    delay = delay << shift;
+    if (delay > 30_000) delay = 30_000;
+    self.backoff_until = g.evloop.time + delay;
 }
 
 // ======================================================
@@ -955,6 +976,9 @@ const TCP = struct {
     pub fn send_query(self: *TCP, qmsg: *RcMsg) bool {
         const proxied = use_proxy(self.upstream);
 
+        if (!self.upstream.can_try())
+            return false;
+
         if (self.is_retire()) {
             const new_session = new(self.upstream);
             self.upstream.session = new_session;
@@ -1236,11 +1260,12 @@ const TCP = struct {
     }
 
     /// `errmsg`: null means strerror(errno)
-    fn on_error(self: *const TCP, op: cc.ConstStr, errmsg: ?cc.ConstStr) ?void {
+    fn on_error(self: *TCP, op: cc.ConstStr, errmsg: ?cc.ConstStr) ?void {
         if (self.fdobj.?.canceled)
             return null;
 
         const src = @src();
+        self.upstream.note_fail();
         // throttle repetitive errors to avoid log flooding
         const now = g.evloop.time;
         const suppress_window_ms: u64 = 5000;
@@ -1266,6 +1291,8 @@ const TCP = struct {
     }
 
     fn connect(self: *TCP) ?void {
+        if (!self.upstream.can_try())
+            return null;
         // null means strerror(errno)
         const errmsg: ?cc.ConstStr = e: {
             const fdobj = self.fdobj.?;
@@ -1274,23 +1301,30 @@ const TCP = struct {
                     break :e "proxy backoff";
                 const proxy_addr = g.proxy_addr.?;
                 g.evloop.connect(fdobj, &proxy_addr) orelse {
+                    self.upstream.note_fail();
                     g.proxy_note_fail();
                     break :e null;
                 };
 
                 if (socks5.greet_noauth(fdobj)) |err| {
+                    self.upstream.note_fail();
                     g.proxy_note_fail();
                     break :e err;
                 }
 
                 if (socks5.request_connect(fdobj, &self.upstream.addr)) |err| {
+                    self.upstream.note_fail();
                     g.proxy_note_fail();
                     break :e err;
                 }
                 g.proxy_note_success();
             } else {
-                g.evloop.connect(fdobj, &self.upstream.addr) orelse break :e null;
+                g.evloop.connect(fdobj, &self.upstream.addr) orelse {
+                    self.upstream.note_fail();
+                    break :e null;
+                };
             }
+            self.upstream.note_success();
 
             if (has_tls and self.upstream.proto == .tls) {
                 self.tls.new_ssl(fdobj.fd, self.upstream.host) orelse break :e "unable to create ssl object";

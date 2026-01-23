@@ -33,9 +33,24 @@ pub const SockType = enum {
 };
 
 pub noinline fn new_sock(family: c.sa_family_t, socktype: SockType) ?c_int {
+    const now = g.evloop.time;
+    if (now < g.socket_backoff_until)
+        return null;
+
     return cc.socket(family, socktype.value() | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, 0) orelse {
         const str_family = if (family == c.AF_INET) "ipv4" else "ipv6";
-        log.err(@src(), "socket(%s, %s) failed: (%d) %m", .{ str_family, socktype.str(), cc.errno() });
+        g.socket_err_counter +|= 1;
+        const window_ms: u64 = 5000;
+        const err_no = cc.errno();
+        if (err_no == c.EMFILE) {
+            // enter short global backoff to avoid log/FD storm
+            g.socket_backoff_until = now + 5000;
+        }
+        if (g.socket_err_last_ms == 0 or now - g.socket_err_last_ms >= window_ms) {
+            g.socket_err_last_ms = now;
+            log.err(@src(), "socket(%s, %s) failed: (%d) %m [cnt:%u]", .{ str_family, socktype.str(), err_no, cc.to_uint(g.socket_err_counter) });
+            g.socket_err_counter = 0;
+        }
         return null;
     };
 }

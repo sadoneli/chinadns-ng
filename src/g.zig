@@ -113,6 +113,11 @@ pub var tcp_read_err_last_ms: u64 = 0;
 pub var tcp_accept_err_counter: u32 = 0;
 pub var tcp_accept_err_last_ms: u64 = 0;
 
+// socket creation error throttling
+pub var socket_err_counter: u32 = 0;
+pub var socket_err_last_ms: u64 = 0;
+pub var socket_backoff_until: u64 = 0; // stop opening new sockets until this time
+
 // proxy failure backoff (monotonic ms, from evloop.time)
 pub var proxy_backoff_until: u64 = 0;
 pub var proxy_backoff_step: u8 = 0;

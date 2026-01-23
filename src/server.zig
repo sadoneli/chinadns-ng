@@ -243,7 +243,7 @@ fn tcp_listener(fd: c_int, ip: cc.ConstStr, port: u16) void {
             g.tcp_accept_err_counter +|= 1;
             const now = g.evloop.time;
             const window_ms: u64 = 2000;
-            if (g.tcp_accept_err_counter == 1 or now - g.tcp_accept_err_last_ms >= window_ms) {
+            if (now - g.tcp_accept_err_last_ms >= window_ms) {
                 g.tcp_accept_err_last_ms = now;
                 log.warn(@src(), "accept(fd:%d, %s#%u) failed: (%d) %m [cnt:%u]", .{ fd, ip, cc.to_uint(port), cc.errno(), cc.to_uint(g.tcp_accept_err_counter) });
                 g.tcp_accept_err_counter = 0;
@@ -287,7 +287,7 @@ fn tcp_server(fd: c_int, p_src_addr: *const cc.SockAddr) void {
                     g.tcp_read_err_counter +|= 1;
                     const now = g.evloop.time;
                     const window_ms: u64 = 5000;
-                    if (g.tcp_read_err_counter == 1 or now - g.tcp_read_err_last_ms >= window_ms) {
+                    if (now - g.tcp_read_err_last_ms >= window_ms) {
                         g.tcp_read_err_last_ms = now;
                         log.warn(src, "read_len(fd:%d, %s#%u) failed: (%d) %m [cnt:%u]", .{ fd, &ip, cc.to_uint(port), cc.errno(), cc.to_uint(g.tcp_read_err_counter) });
                         g.tcp_read_err_counter = 0;
