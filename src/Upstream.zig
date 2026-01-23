@@ -141,10 +141,14 @@ fn send(self: *Upstream, qmsg: *RcMsg) bool {
 }
 
 fn udp_session(self: *Upstream) ?*UDP {
+    if (!self.can_try())
+        return null;
     return self.get_session(UDP);
 }
 
 fn tcp_session(self: *Upstream) ?*TCP {
+    if (!self.can_try())
+        return null;
     return self.get_session(TCP);
 }
 
@@ -1003,7 +1007,7 @@ const TCP = struct {
 
         if (self.pending_n >= PENDING_MAX) {
             log.warn(@src(), "too many pending queries: %u", .{cc.to_uint(self.pending_n)});
-            return false;
+            return false; // caller will reply SERVFAIL
         }
 
         self.session_node.on_work(self.is_idle());

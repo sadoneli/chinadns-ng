@@ -184,6 +184,7 @@ const Query = struct {
 
             if (self.count() >= std.math.maxInt(u16) + 1) {
                 log.warn(src, "too many pending queries: %zu", .{self.count()});
+                // drop immediately, do not enqueue; caller will reply SERVFAIL
                 return null;
             }
 
@@ -195,6 +196,7 @@ const Query = struct {
                     break qid;
             } else {
                 log.warn(src, "no available qid. pending queries: %zu", .{self.count()});
+                // drop immediately, do not enqueue; caller will reply SERVFAIL
                 return null;
             };
 
