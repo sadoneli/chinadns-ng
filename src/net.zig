@@ -1,3 +1,4 @@
+const std = @import("std");
 const g = @import("g.zig");
 const c = @import("c.zig");
 const cc = @import("cc.zig");
@@ -43,8 +44,9 @@ pub noinline fn new_sock(family: c.sa_family_t, socktype: SockType) ?c_int {
         const window_ms: u64 = 5000;
         const err_no = cc.errno();
         if (err_no == c.EMFILE) {
-            // enter short global backoff to avoid log/FD storm
-            g.socket_backoff_until = now + 5000;
+            // enter global backoff to avoid log/FD storm; extend window if already backing off
+            const dur: u64 = g.socket_backoff_ms;
+            g.socket_backoff_until = std.math.max(g.socket_backoff_until, now + dur);
         }
         if (g.socket_err_last_ms == 0 or now - g.socket_err_last_ms >= window_ms) {
             g.socket_err_last_ms = now;

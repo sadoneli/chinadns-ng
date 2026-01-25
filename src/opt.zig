@@ -54,6 +54,11 @@ const help =
 \\ --proxy-server <url>                 socks5 proxy for trust upstream dns (no auth)
 \\ --proxy-group <tags>                 tag list to use proxy, default: gfw
 \\ --proxy-protocol <list>              proxy only these upstream protos: tcp,tls,udp
+\\ --pending-max <N>                    global pending queries upper bound (default: 4096)
+\\ --upstream-pending-max <N>           per-upstream pending upper bound (default: 2048)
+\\ --upstream-fail-threshold <N>        consecutive fails before marking upstream down (default: 3)
+\\ --upstream-down-ms <ms>              initial circuit-breaker down duration (default: 10000, max 60000)
+\\ --socket-backoff-ms <ms>             EMFILE backoff window (default: 10000)
 \\ --no-ipset-blacklist                 add-ip: don't enable built-in ip blacklist
 \\                                      blacklist: 127.0.0.0/8, 0.0.0.0/8, ::1, ::
     \\ -o, --timeout-sec <sec>              response timeout of upstream, default: 5
@@ -154,6 +159,11 @@ const optdef_array = [_]OptDef{
     .{ .short = "",  .long = "proxy-server",       .value = .required, .optfn = opt_proxy_server,       },
     .{ .short = "",  .long = "proxy-group",        .value = .required, .optfn = opt_proxy_group,        },
     .{ .short = "",  .long = "proxy-protocol",     .value = .required, .optfn = opt_proxy_protocol,     },
+    .{ .short = "",  .long = "pending-max",        .value = .required, .optfn = opt_pending_max,        },
+    .{ .short = "",  .long = "upstream-pending-max", .value = .required, .optfn = opt_upstream_pending_max, },
+    .{ .short = "",  .long = "upstream-fail-threshold", .value = .required, .optfn = opt_upstream_fail_threshold, },
+    .{ .short = "",  .long = "upstream-down-ms",   .value = .required, .optfn = opt_upstream_down_ms,   },
+    .{ .short = "",  .long = "socket-backoff-ms",  .value = .required, .optfn = opt_socket_backoff_ms,  },
     .{ .short = "",  .long = "no-ipset-blacklist", .value = .no_value, .optfn = opt_no_ipset_blacklist, },
     .{ .short = "o", .long = "timeout-sec",        .value = .required, .optfn = opt_timeout_sec,        },
     .{ .short = "p", .long = "repeat-times",       .value = .required, .optfn = opt_repeat_times,       },
@@ -650,6 +660,42 @@ fn opt_proxy_protocol(in_value: ?[]const u8) void {
         invalid_optvalue(src, value);
 
     g.proxy_proto_mask = mask;
+}
+
+fn opt_pending_max(in_value: ?[]const u8) void {
+    const value = in_value.?;
+    const parsed = str2int.parse(u32, value, 10) orelse invalid_optvalue(@src(), value);
+    if (parsed == 0) invalid_optvalue(@src(), value);
+    g.pending_query_max = parsed;
+}
+
+fn opt_upstream_pending_max(in_value: ?[]const u8) void {
+    const value = in_value.?;
+    const parsed = str2int.parse(u32, value, 10) orelse invalid_optvalue(@src(), value);
+    if (parsed == 0) invalid_optvalue(@src(), value);
+    g.upstream_pending_max = parsed;
+}
+
+fn opt_upstream_fail_threshold(in_value: ?[]const u8) void {
+    const value = in_value.?;
+    const parsed = str2int.parse(u8, value, 10) orelse invalid_optvalue(@src(), value);
+    if (parsed == 0) invalid_optvalue(@src(), value);
+    g.upstream_fail_threshold = parsed;
+}
+
+fn opt_upstream_down_ms(in_value: ?[]const u8) void {
+    const value = in_value.?;
+    const parsed = str2int.parse(u32, value, 10) orelse invalid_optvalue(@src(), value);
+    if (parsed == 0) invalid_optvalue(@src(), value);
+    g.upstream_down_ms = parsed;
+    g.upstream_down_max_ms = std.math.max(g.upstream_down_ms, g.upstream_down_max_ms);
+}
+
+fn opt_socket_backoff_ms(in_value: ?[]const u8) void {
+    const value = in_value.?;
+    const parsed = str2int.parse(u32, value, 10) orelse invalid_optvalue(@src(), value);
+    if (parsed == 0) invalid_optvalue(@src(), value);
+    g.socket_backoff_ms = parsed;
 }
 
 fn opt_no_ipset_blacklist(_: ?[]const u8) void {

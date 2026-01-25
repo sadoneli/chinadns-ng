@@ -346,6 +346,14 @@ usage: chinadns-ng <options...>. the existing options are as follows:
  --dns-rr-ip <names>=<ips>            define local resource records of type A/AAAA
  --cert-verify                        enable SSL certificate validation, default: no
  --ca-certs <path>                    CA certs path for SSL certificate validation
+ --proxy-server <url>                 socks5 proxy for trust upstream dns (no auth)
+ --proxy-group <tags>                 tag list to use proxy, default: gfw
+ --proxy-protocol <list>              proxy only these upstream protos: tcp,tls,udp
+ --pending-max <N>                    global pending queries upper bound, default: 4096
+ --upstream-pending-max <N>           per-upstream pending upper bound, default: 2048
+ --upstream-fail-threshold <N>        consecutive fails before marking upstream down, default: 3
+ --upstream-down-ms <ms>              initial circuit-breaker down duration, default: 10000 (max 60000)
+ --socket-backoff-ms <ms>             EMFILE backoff window, default: 10000
  --no-ipset-blacklist                 add-ip: don't enable built-in ip blacklist
                                       blacklist: 127.0.0.0/8, 0.0.0.0/8, ::1, ::
  -o, --timeout-sec <sec>              response timeout of upstream, default: 5
@@ -600,6 +608,19 @@ group-upstream 192.168.1.1
 - `proxy-group` 指定哪些域名组(tag)的上游请求需要走 `proxy-server`。
   - 例：`proxy-group gfw,us,uk`，表示 gfw/us/uk 三个组都走代理。
   - 默认值为 `gfw`（兼容旧行为：只代理 trust 组）。
+
+### proxy-protocol
+
+- `proxy-protocol` 细化代理协议范围，只为给定协议走代理，其余协议直连。
+  - 可选值：`tcp`、`tls`、`udp`，可组合，默认全开。
+  - 例：`proxy-protocol tcp,tls` 表示 DoT/TCP 上游走代理，UDP 上游直连。
+
+### 负载防护/退避
+
+- `pending-max` 全局最大排队查询数，超过后立即 SERVFAIL，默认 4096。
+- `upstream-pending-max` 单个上游（会话）最大排队查询数，默认 2048。
+- `upstream-fail-threshold` 连续失败次数后触发熔断，`upstream-down-ms` 为初始熔断时间（默认 10s，最大 60s，失败越多窗口越长）。
+- `socket-backoff-ms` 遇到 EMFILE 时的全局退避窗口，退避期间快速拒绝新建 socket，默认 10s。
 
 ### no-ipset-blacklist
 

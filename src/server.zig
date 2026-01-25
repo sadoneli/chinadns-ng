@@ -178,15 +178,16 @@ const Query = struct {
             qnamelen: c_int,
             tag: Tag,
             flags: Flags,
-            req_msg: ?*RcMsg,
-        ) ?*Query {
-            const src = @src();
+        req_msg: ?*RcMsg,
+    ) ?*Query {
+        const src = @src();
 
-            if (self.count() >= std.math.maxInt(u16) + 1) {
-                log.warn(src, "too many pending queries: %zu", .{self.count()});
-                // drop immediately, do not enqueue; caller will reply SERVFAIL
-                return null;
-            }
+        const max_pending = std.math.max(@as(usize, 1), @as(usize, g.pending_query_max));
+        if (self.count() >= max_pending or self.count() >= std.math.maxInt(u16) + 1) {
+            log.warn(src, "too many pending queries: %zu (limit:%zu)", .{ self.count(), max_pending });
+            // drop immediately, do not enqueue; caller will reply SERVFAIL
+            return null;
+        }
 
             var i: u32 = 0;
             const qid = while (i < 10) : (i += 1) {

@@ -64,10 +64,20 @@ proto: Proto,
 tag: Tag,
 backoff_until: u64 = 0,
 backoff_step: u8 = 0,
+fail_streak: u8 = 0,
+down_until: u64 = 0,
 
 const ParamValue = u16;
 const DEFAULT_COUNT: ParamValue = 10;
 const DEFAULT_LIFE: ParamValue = 10;
+const PENDING_HARD_MAX: u32 = std.math.maxInt(u16);
+const REUSE_MAX_TCP: u16 = c.DNS_EDNS_MAXSIZE;
+const REUSE_MAX_UDP: u16 = c.DNS_EDNS_MAXSIZE + socks5.UDP_OVERHEAD_MAX;
+
+inline fn pending_limit() u16 {
+    const max_allowed = std.math.min(PENDING_HARD_MAX, g.upstream_pending_max);
+    return @intCast(u16, std.math.max(@as(u32, 1), max_allowed));
+}
 
 // ======================================================
 
@@ -163,12 +173,15 @@ fn session_eql(self: *const Upstream, in_session: ?*const anyopaque) bool {
 }
 
 fn can_try(self: *const Upstream) bool {
-    return g.evloop.time >= self.backoff_until;
+    const now = g.evloop.time;
+    return now >= self.backoff_until and now >= self.down_until;
 }
 
 fn note_success(self: *Upstream) void {
     self.backoff_until = 0;
     self.backoff_step = 0;
+    self.fail_streak = 0;
+    self.down_until = 0;
 }
 
 fn note_fail(self: *Upstream) void {
@@ -179,6 +192,17 @@ fn note_fail(self: *Upstream) void {
     delay = delay << shift;
     if (delay > 30_000) delay = 30_000;
     self.backoff_until = g.evloop.time + delay;
+
+    if (self.fail_streak < std.math.maxInt(@TypeOf(self.fail_streak)))
+        self.fail_streak += 1;
+    if (self.fail_streak >= g.upstream_fail_threshold) {
+        const cb_shift: u6 = @intCast(u6, std.math.min(@as(u32, self.fail_streak - g.upstream_fail_threshold), 8));
+        const base = @as(u64, g.upstream_down_ms);
+        var down = base << cb_shift;
+        const down_max: u64 = g.upstream_down_max_ms;
+        if (down > down_max) down = down_max;
+        self.down_until = g.evloop.time + down;
+    }
 }
 
 // ======================================================
@@ -362,6 +386,16 @@ const UDP = struct {
 
     /// [nosuspend]
     pub fn send_query(self: *UDP, qmsg: *RcMsg) bool {
+        const limit = pending_limit();
+        if (self.query_list.count() >= limit) {
+            log.warn(@src(), "too many pending udp queries to %s: %zu (limit:%u)", .{
+                self.upstream.url,
+                self.query_list.count(),
+                cc.to_uint(limit),
+            });
+            return false;
+        }
+
         if (self.should_retire()) {
             if (!self.upstream.session_eql(self))
                 return false;
@@ -672,13 +706,16 @@ const UDP = struct {
             _ = rmsg.ref();
             defer {
                 const refs = rmsg.ref_count();
+                rmsg.unref(); // drop guard
                 if (refs == 2) {
-                    free_rmsg = rmsg;
-                    rmsg.unref(); // drop guard
-                } else {
-                    rmsg.unref(); // drop guard
-                    if (refs > 2)
-                        rmsg.unref(); // drop receiver ref
+                    if (rmsg.cap <= REUSE_MAX_UDP) {
+                        free_rmsg = rmsg;
+                    } else {
+                        // drop receiver ref to free oversized buffer
+                        rmsg.unref();
+                    }
+                } else if (refs > 2) {
+                    rmsg.unref(); // drop receiver ref
                 }
             }
 
@@ -805,13 +842,14 @@ const TCP = struct {
 
     const TLS_ = if (has_tls) TLS else struct {};
 
-    /// must <= u16_max
-    const PENDING_MAX = std.math.maxInt(u16);
-
     const MsgQueue = struct {
         head: ?*Msg = null,
         tail: ?*Msg = null,
         waiter: ?anyframe = null,
+        free_list: ?*Msg = null,
+        free_len: u16 = 0,
+
+        const FREE_MAX: u16 = 128;
 
         const Msg = struct {
             msg: *RcMsg,
@@ -830,7 +868,7 @@ const TCP = struct {
                 return;
             }
 
-            const node = g.allocator.create(Msg) catch unreachable;
+            const node = self.acquire_node();
             node.* = .{
                 .msg = msg,
                 .next = undefined,
@@ -862,7 +900,6 @@ const TCP = struct {
         /// `null`: cancel wait
         pub fn pop(self: *MsgQueue, comptime suspending: bool) ?*RcMsg {
             if (self.head) |node| {
-                defer g.allocator.destroy(node);
                 if (node == self.tail) {
                     self.head = null;
                     self.tail = null;
@@ -870,7 +907,9 @@ const TCP = struct {
                     self.head = node.next;
                     assert(self.tail != null);
                 }
-                return node.msg;
+                const msg = node.msg;
+                self.release_node(node);
+                return msg;
             } else {
                 if (!suspending)
                     return null;
@@ -897,6 +936,39 @@ const TCP = struct {
         pub fn clear(self: *MsgQueue) void {
             while (self.pop(false)) |msg|
                 msg.unref();
+            // drop cached nodes to release memory pressure
+            self.free_nodes();
+        }
+
+        fn acquire_node(self: *MsgQueue) *Msg {
+            if (self.free_list) |node| {
+                self.free_list = node.next;
+                if (self.free_len > 0)
+                    self.free_len -= 1;
+                return node;
+            }
+            return g.allocator.create(Msg) catch unreachable;
+        }
+
+        fn release_node(self: *MsgQueue, node: *Msg) void {
+            if (self.free_len < FREE_MAX) {
+                node.next = self.free_list orelse node;
+                self.free_list = node;
+                self.free_len +|= 1;
+            } else {
+                g.allocator.destroy(node);
+            }
+        }
+
+        fn free_nodes(self: *MsgQueue) void {
+            var node_opt = self.free_list;
+            while (node_opt) |node| {
+                const next = if (node.next == node) null else node.next;
+                g.allocator.destroy(node);
+                node_opt = next;
+            }
+            self.free_list = null;
+            self.free_len = 0;
         }
     };
 
@@ -1005,8 +1077,13 @@ const TCP = struct {
             return false;
         }
 
-        if (self.pending_n >= PENDING_MAX) {
-            log.warn(@src(), "too many pending queries: %u", .{cc.to_uint(self.pending_n)});
+        const limit: u16 = pending_limit();
+        if (self.pending_n >= limit) {
+            log.warn(@src(), "too many pending tcp queries to %s: %u (limit:%u)", .{
+                self.upstream.url,
+                cc.to_uint(self.pending_n),
+                cc.to_uint(limit),
+            });
             return false; // caller will reply SERVFAIL
         }
 
@@ -1222,6 +1299,10 @@ const TCP = struct {
                 log.warn(@src(), "recv(%s) failed: invalid len:%u", .{ self.upstream.url, cc.to_uint(len) });
                 return;
             }
+            if (len > c.DNS_MSG_MAXSIZE) {
+                log.warn(@src(), "recv(%s) failed: oversize len:%u", .{ self.upstream.url, cc.to_uint(len) });
+                return;
+            }
 
             const rmsg: *RcMsg = if (free_rmsg) |rmsg| rmsg.realloc(len) else RcMsg.new(len);
             free_rmsg = null;
@@ -1230,13 +1311,15 @@ const TCP = struct {
             _ = rmsg.ref();
             defer {
                 const refs = rmsg.ref_count();
+                rmsg.unref(); // drop guard
                 if (refs == 2) {
-                    free_rmsg = rmsg;
-                    rmsg.unref(); // drop guard
-                } else {
-                    rmsg.unref(); // drop guard
-                    if (refs > 2)
-                        rmsg.unref(); // drop receiver ref
+                    if (rmsg.cap <= REUSE_MAX_TCP) {
+                        free_rmsg = rmsg;
+                    } else {
+                        rmsg.unref(); // drop receiver ref to free oversized buffer
+                    }
+                } else if (refs > 2) {
+                    rmsg.unref(); // drop receiver ref
                 }
             }
 

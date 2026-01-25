@@ -52,6 +52,19 @@ pub var trustdns_packet_n: u8 = 1;
 /// in seconds
 pub var upstream_timeout: u8 = 5;
 
+/// global pending query upper bound (all clients combined)
+pub var pending_query_max: u32 = 4096;
+
+/// per-upstream pending upper bound (per session, tcp/udp)
+pub var upstream_pending_max: u32 = 2048;
+
+/// consecutive failures before marking an upstream temporarily down
+pub var upstream_fail_threshold: u8 = 3;
+
+/// circuit-breaker base/backoff window in ms (clamped by `upstream_down_max_ms`)
+pub var upstream_down_ms: u32 = 10_000;
+pub var upstream_down_max_ms: u32 = 60_000;
+
 /// dns cache (0 means disable)
 pub var cache_size: u16 = 0;
 
@@ -117,6 +130,7 @@ pub var tcp_accept_err_last_ms: u64 = 0;
 pub var socket_err_counter: u32 = 0;
 pub var socket_err_last_ms: u64 = 0;
 pub var socket_backoff_until: u64 = 0; // stop opening new sockets until this time
+pub var socket_backoff_ms: u32 = 10_000; // EMFILE backoff duration
 
 // proxy failure backoff (monotonic ms, from evloop.time)
 pub var proxy_backoff_until: u64 = 0;
