@@ -388,9 +388,9 @@ const UDP = struct {
     pub fn send_query(self: *UDP, qmsg: *RcMsg) bool {
         const limit = pending_limit();
         if (self.query_list.count() >= limit) {
-            log.warn(@src(), "too many pending udp queries to %s: %zu (limit:%u)", .{
+            log.warn(@src(), "too many pending udp queries to %s: %u (limit:%u)", .{
                 self.upstream.url,
-                self.query_list.count(),
+                cc.to_uint(self.query_list.count()),
                 cc.to_uint(limit),
             });
             return false;
