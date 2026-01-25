@@ -846,11 +846,6 @@ const TCP = struct {
         head: ?*Msg = null,
         tail: ?*Msg = null,
         waiter: ?anyframe = null,
-        free_list: ?*Msg = null,
-        free_len: u16 = 0,
-
-        const FREE_MAX: u16 = 128;
-
         const Msg = struct {
             msg: *RcMsg,
             next: *Msg,
@@ -936,39 +931,14 @@ const TCP = struct {
         pub fn clear(self: *MsgQueue) void {
             while (self.pop(false)) |msg|
                 msg.unref();
-            // drop cached nodes to release memory pressure
-            self.free_nodes();
         }
 
-        fn acquire_node(self: *MsgQueue) *Msg {
-            if (self.free_list) |node| {
-                self.free_list = node.next;
-                if (self.free_len > 0)
-                    self.free_len -= 1;
-                return node;
-            }
+        fn acquire_node(_: *MsgQueue) *Msg {
             return g.allocator.create(Msg) catch unreachable;
         }
 
-        fn release_node(self: *MsgQueue, node: *Msg) void {
-            if (self.free_len < FREE_MAX) {
-                node.next = self.free_list orelse node;
-                self.free_list = node;
-                self.free_len +|= 1;
-            } else {
-                g.allocator.destroy(node);
-            }
-        }
-
-        fn free_nodes(self: *MsgQueue) void {
-            var node_opt = self.free_list;
-            while (node_opt) |node| {
-                const next = if (node.next == node) null else node.next;
-                g.allocator.destroy(node);
-                node_opt = next;
-            }
-            self.free_list = null;
-            self.free_len = 0;
+        fn release_node(_: *MsgQueue, node: *Msg) void {
+            g.allocator.destroy(node);
         }
     };
 
