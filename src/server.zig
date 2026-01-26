@@ -31,7 +31,7 @@ const Query = struct {
     // alignment: 8/4
     fdobj: *EvLoop.Fd, // requester's fdobj
     trust_msg: ?*RcMsg = null,
-    req_msg: ?*RcMsg = null,
+    req_buf: ?[]u8 = null,
     req_time: u64, // monotonic time (ms)
 
     // alignment: 4
@@ -75,7 +75,7 @@ const Query = struct {
         qnamelen: c_int,
         tag: Tag,
         flags: Flags,
-        req_msg: ?*RcMsg,
+        req_buf: ?[]u8,
     ) *Query {
         const self = g.allocator.create(Query) catch unreachable;
 
@@ -89,7 +89,7 @@ const Query = struct {
             .flags = flags,
             .req_time = g.evloop.time,
             .qnamelen = qnamelen,
-            .req_msg = if (flags.from_client()) req_msg.?.ref() else null,
+            .req_buf = if (flags.from_client()) req_buf else null,
         };
 
         return self;
@@ -102,8 +102,8 @@ const Query = struct {
         if (self.trust_msg) |msg| {
             msg.unref();
         }
-        if (self.req_msg) |msg| {
-            msg.unref();
+        if (self.req_buf) |buf| {
+            g.allocator.free(buf);
         }
 
         g.allocator.destroy(self);
@@ -141,9 +141,8 @@ const Query = struct {
         }
 
         if (self.flags.from_client()) {
-            if (self.req_msg) |qmsg| {
-                const msg = dns.servfail_reply(qmsg.msg(), self.qnamelen);
-                qmsg.len = cc.to_u16(msg.len);
+            if (self.req_buf) |buf| {
+                const msg = dns.servfail_reply(buf, self.qnamelen);
                 send_reply(msg, self.fdobj, &self.src_addr, self.bufsz, self.id, self.flags);
             }
         }
@@ -178,16 +177,15 @@ const Query = struct {
             qnamelen: c_int,
             tag: Tag,
             flags: Flags,
-        req_msg: ?*RcMsg,
-    ) ?*Query {
-        const src = @src();
+        ) ?*Query {
+            const src = @src();
 
-        const max_pending = std.math.max(@as(usize, 1), @as(usize, g.pending_query_max));
-        if (self.count() >= max_pending or self.count() >= std.math.maxInt(u16) + 1) {
-            log.warn(src, "too many pending queries: %zu (limit:%zu)", .{ self.count(), max_pending });
-            // drop immediately, do not enqueue; caller will reply SERVFAIL
-            return null;
-        }
+            const max_pending = std.math.max(@as(usize, 1), @as(usize, g.pending_query_max));
+            if (self.count() >= max_pending or self.count() >= std.math.maxInt(u16) + 1) {
+                log.warn(src, "too many pending queries: %zu (limit:%zu)", .{ self.count(), max_pending });
+                // drop immediately, do not enqueue; caller will reply SERVFAIL
+                return null;
+            }
 
             var i: u32 = 0;
             const qid = while (i < 10) : (i += 1) {
@@ -204,7 +202,16 @@ const Query = struct {
             const id = dns.get_id(msg);
             dns.set_id(msg, qid);
 
-            const q = Query.new(qid, id, bufsz, fdobj, src_addr, qnamelen, tag, flags, req_msg);
+            var q_req_buf: ?[]u8 = null;
+            if (flags.from_client()) {
+                const min_len = @as(usize, dns.header_len()) + @as(usize, dns.question_len(qnamelen));
+                if (min_len <= msg.len) {
+                    q_req_buf = g.allocator.alloc(u8, min_len) catch unreachable;
+                    @memcpy(q_req_buf.?.ptr, msg.ptr, min_len);
+                }
+            }
+
+            const q = Query.new(qid, id, bufsz, fdobj, src_addr, qnamelen, tag, flags, q_req_buf);
 
             self.map.putNoClobber(g.allocator, qid, q) catch unreachable;
             self.list.link_to_tail(&q.node);
@@ -677,7 +684,6 @@ fn on_query(qmsg: *RcMsg, fdobj: *EvLoop.Fd, src_addr: *const cc.SockAddr, in_qf
         qnamelen,
         tag,
         qflags,
-        if (qflags.from_client()) qmsg else null,
     ) orelse {
         if (qflags.from_client()) {
             const rmsg = dns.servfail_reply(msg, qnamelen);

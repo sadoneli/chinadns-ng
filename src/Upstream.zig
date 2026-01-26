@@ -17,6 +17,15 @@ const str2int = @import("str2int.zig");
 const socks5 = @import("socks5.zig");
 const assert = std.debug.assert;
 
+const session_magic_alive: u32 = 0x53455353; // "SESS"
+const session_magic_freed: u32 = 0xDEAD5E55;
+const SessionKind = enum { udp, tcp };
+const SessionMeta = struct {
+    ptr: *anyopaque,
+    upstream: *Upstream,
+    kind: SessionKind,
+};
+
 fn use_proxy(upstream: *const Upstream) bool {
     if (g.proxy_addr == null)
         return false;
@@ -51,8 +60,8 @@ comptime {
 
 const Upstream = @This();
 
-// session
-session: ?*anyopaque = null, // `struct UDP` or `struct TCP`
+// session id (0 means none)
+session_id: u32 = 0,
 
 // config
 host: ?cc.ConstStr, // DoT SNI
@@ -131,7 +140,7 @@ fn init(
 
 /// for `Group.rm_useless` (at startup)
 fn deinit(self: *const Upstream) void {
-    assert(self.session == null);
+    assert(self.session_id == 0);
 
     if (self.host) |host|
         g.allocator.free(cc.strslice_c(host));
@@ -140,6 +149,45 @@ fn deinit(self: *const Upstream) void {
 }
 
 // ======================================================
+
+var _session_table: std.AutoHashMapUnmanaged(u32, SessionMeta) = .{};
+var _session_next_id: u32 = 1;
+
+pub fn module_init() void {
+    _session_table = .{};
+    _session_next_id = 1;
+}
+
+fn register_session(ptr: anytype, upstream: *Upstream, kind: SessionKind) u32 {
+    var id = _session_next_id;
+    _session_next_id +%= 1;
+    if (_session_next_id == 0)
+        _session_next_id = 1;
+    _session_table.put(g.allocator, id, .{
+        .ptr = @ptrCast(*anyopaque, ptr),
+        .upstream = upstream,
+        .kind = kind,
+    }) catch unreachable;
+    return id;
+}
+
+fn unregister_session(id: u32) void {
+    _ = _session_table.remove(id);
+}
+
+fn install_session(upstream: *Upstream, session: anytype, kind: SessionKind) void {
+    const id = register_session(session, upstream, kind);
+    session.session_node.id = id;
+    upstream.session_id = id;
+}
+
+fn session_kind_matches(comptime T: type, kind: SessionKind) bool {
+    if (T == UDP)
+        return kind == .udp;
+    if (T == TCP)
+        return kind == .tcp;
+    return false;
+}
 
 /// [nosuspend] send query to upstream
 fn send(self: *Upstream, qmsg: *RcMsg) bool {
@@ -153,23 +201,41 @@ fn send(self: *Upstream, qmsg: *RcMsg) bool {
 fn udp_session(self: *Upstream) ?*UDP {
     if (!self.can_try())
         return null;
-    return self.get_session(UDP);
+    return self.get_session(UDP, .udp);
 }
 
 fn tcp_session(self: *Upstream) ?*TCP {
     if (!self.can_try())
         return null;
-    return self.get_session(TCP);
+    return self.get_session(TCP, .tcp);
 }
 
-fn get_session(self: *Upstream, comptime T: type) ?*T {
-    if (self.session == null)
-        self.session = T.new(self);
-    return cc.ptrcast(?*T, self.session);
+fn get_session(self: *Upstream, comptime T: type, kind: SessionKind) ?*T {
+    if (self.session_id != 0) {
+        if (_session_table.get(self.session_id)) |meta| {
+            if (meta.upstream == self and session_kind_matches(T, meta.kind)) {
+                return cc.ptrcast(*T, meta.ptr);
+            }
+            log.err(@src(), "session id mismatch, reset: %u", .{cc.to_uint(self.session_id)});
+        } else {
+            log.err(@src(), "session id missing, reset: %u", .{cc.to_uint(self.session_id)});
+        }
+        self.session_id = 0;
+    }
+
+    if (self.session_id == 0) {
+        const session = if (T == UDP)
+            T.new(self) orelse return null
+        else
+            T.new(self);
+        install_session(self, session, kind);
+        return session;
+    }
+    return null;
 }
 
-fn session_eql(self: *const Upstream, in_session: ?*const anyopaque) bool {
-    return self.session == in_session;
+fn session_eql(self: *const Upstream, session_id: u32) bool {
+    return session_id != 0 and self.session_id == session_id;
 }
 
 fn can_try(self: *const Upstream) bool {
@@ -207,50 +273,44 @@ fn note_fail(self: *Upstream) void {
 
 // ======================================================
 
-/// for check_timeout (response timeout)
-var _session_list: Node = undefined;
-
-pub fn module_init() void {
-    _session_list.init();
-}
-
-pub fn check_timeout(timer: *EvLoop.Timer) void {
-    var node = _session_list.head();
-    while (node != &_session_list) {
-        const next = node.next; // safe iteration even if current gets unlinked/freed
-        const session_node = SessionNode.from(node);
-        switch (session_node.type) {
-            .udp => {
-                const session = session_node.udp();
-                if (session.is_idle()) {
-                    session.session_node.on_idle();
-                    break;
-                }
-                if (timer.check_deadline(session.get_deadline()))
-                    session.free()
-                else
-                    break;
-            },
-            .tcp => {
-                const session = session_node.tcp();
-                if (session.is_idle()) {
-                    session.session_node.on_idle();
-                    break;
-                }
-                if (timer.check_deadline(session.get_deadline()))
-                    session.free()
-                else
-                    break;
-            },
-        }
-        node = next;
+pub fn check_timeout_upstream(upstream: *Upstream, timer: *EvLoop.Timer) void {
+    const session_id = upstream.session_id;
+    if (session_id == 0)
+        return;
+    const meta = _session_table.get(session_id) orelse {
+        upstream.session_id = 0;
+        return;
+    };
+    if (meta.upstream != upstream) {
+        log.err(@src(), "timeout session mismatch, reset: %u", .{cc.to_uint(session_id)});
+        upstream.session_id = 0;
+        return;
+    }
+    switch (meta.kind) {
+        .udp => {
+            const session = cc.ptrcast(*UDP, meta.ptr);
+            if (session.is_idle())
+                return;
+            if (timer.check_deadline(session.get_deadline()))
+                session.free();
+        },
+        .tcp => {
+            const session = cc.ptrcast(*TCP, meta.ptr);
+            session.cleanup_stale_queries(timer);
+            if (session.is_idle())
+                return;
+            if (timer.check_deadline(session.get_deadline()))
+                session.free();
+        },
     }
 }
 
 const SessionNode = struct {
     type: enum { udp, tcp }, // `struct UDP` or `struct TCP`
-    node: Node = undefined, // _session_list node
+    node: Node = undefined, // legacy list node (unused)
     linked: bool = false,
+    magic: u32 = session_magic_alive,
+    id: u32 = 0,
 
     pub fn from(node: *Node) *SessionNode {
         return @fieldParentPtr(SessionNode, "node", node);
@@ -267,19 +327,24 @@ const SessionNode = struct {
     }
 
     pub fn on_work(self: *SessionNode, from_idle_state: bool) void {
-        if (from_idle_state or !self.linked) {
-            _session_list.link_to_tail(&self.node);
-            self.linked = true;
-        } else {
-            _session_list.move_to_tail(&self.node);
-        }
+        _ = from_idle_state;
+        if (!self.is_alive())
+            return;
+        self.linked = true;
     }
 
     pub fn on_idle(self: *SessionNode) void {
-        if (!self.linked)
+        if (!self.is_alive())
             return;
-        self.node.unlink();
         self.linked = false;
+    }
+
+    pub fn is_alive(self: *const SessionNode) bool {
+        return self.magic == session_magic_alive;
+    }
+
+    pub fn mark_freed(self: *SessionNode) void {
+        self.magic = session_magic_freed;
     }
 };
 
@@ -294,12 +359,15 @@ const UDP = struct {
     fd_canceled: bool = false,
     proxy_fd_canceled: bool = false,
     query_list: std.AutoHashMapUnmanaged(u16, u64) = .{}, // outstanding queries (qid => sent_at ms)
+    stale_buf: std.ArrayListUnmanaged(u16) = .{},
     create_time: u64,
     query_time: u64 = undefined, // last query time
     oldest_query_time: u64 = 0, // oldest outstanding query time
     query_count: u16 = 0, // total query count
     freed: bool = false,
     closing: bool = false,
+    freeing: bool = false, // guard re-entrant free during cancel
+    pending_free: bool = false,
     active: u8 = 0, // running coroutines (reply_receiver/proxy_init)
     proxy_enabled: bool = false,
     proxy_ready: bool = false,
@@ -332,22 +400,39 @@ const UDP = struct {
     /// - reply_receiver
     /// - check_timeout
     fn free(self: *UDP) void {
+        if (!self.session_node.is_alive())
+            return;
         if (self.freed) return;
-        if (self.active > 0) {
-            self.closing = true;
-            if (self.upstream.session_eql(self))
-                self.upstream.session = null;
-            if (!self.fd_canceled) {
-                self.fdobj.cancel();
-                self.fd_canceled = true;
-            }
-            if (self.proxy_fdobj) |pfdobj| if (!self.proxy_fd_canceled) {
-                pfdobj.cancel();
-                self.proxy_fd_canceled = true;
-            };
+        if (self.freeing) {
+            self.pending_free = true;
             return;
         }
+        self.freeing = true;
+        defer self.freeing = false;
+        if (self.active > 0) {
+            self.closing = true;
+            if (self.upstream.session_eql(self.session_node.id))
+                self.upstream.session_id = 0;
+            self.session_node.on_idle();
+            const proxy_fdobj = self.proxy_fdobj;
+            const need_proxy_cancel = proxy_fdobj != null and !self.proxy_fd_canceled;
+            const need_fd_cancel = !self.fd_canceled;
 
+            if (need_proxy_cancel)
+                self.proxy_fd_canceled = true;
+            if (need_fd_cancel)
+                self.fd_canceled = true;
+
+            if (need_proxy_cancel)
+                proxy_fdobj.?.cancel();
+            if (need_fd_cancel)
+                self.fdobj.cancel();
+
+            if (self.active > 0)
+                return;
+        }
+
+        self.pending_free = false;
         self.freed = true;
 
         for (self.proxy_pending.items) |qmsg|
@@ -356,8 +441,8 @@ const UDP = struct {
 
         self.session_node.on_idle();
 
-        if (self.upstream.session_eql(self))
-            self.upstream.session = null;
+        if (self.upstream.session_eql(self.session_node.id))
+            self.upstream.session_id = 0;
 
         if (!self.fd_canceled) {
             self.fdobj.cancel();
@@ -376,7 +461,12 @@ const UDP = struct {
             self.proxy_fd_canceled = false;
         }
 
+        self.stale_buf.clearAndFree(g.allocator);
         self.query_list.clearAndFree(g.allocator);
+        self.session_node.mark_freed();
+        unregister_session(self.session_node.id);
+        self.session_node.id = 0;
+        g.allocator.destroy(self);
     }
 
     pub fn get_deadline(self: *const UDP) u64 {
@@ -397,15 +487,15 @@ const UDP = struct {
         }
 
         if (self.should_retire()) {
-            if (!self.upstream.session_eql(self))
+            if (!self.upstream.session_eql(self.session_node.id))
                 return false;
             if (self.is_idle()) {
                 self.retire();
                 const new_session = new(self.upstream);
-                self.upstream.session = new_session;
-
-                if (new_session) |s|
+                if (new_session) |s| {
+                    install_session(self.upstream, s, .udp);
                     return nosuspend s.send_query(qmsg);
+                }
 
                 if (self.is_idle())
                     self.free();
@@ -630,7 +720,7 @@ const UDP = struct {
     /// no more queries will be sent. \
     /// freed when the queries completes.
     fn should_retire(self: *const UDP) bool {
-        if (!self.upstream.session_eql(self))
+        if (!self.upstream.session_eql(self.session_node.id))
             return true;
 
         if ((self.upstream.count > 0 and self.query_count >= self.upstream.count) or
@@ -641,11 +731,12 @@ const UDP = struct {
     }
 
     fn retire(self: *UDP) void {
-        if (self.upstream.session_eql(self))
-            self.upstream.session = null;
+        if (self.upstream.session_eql(self.session_node.id))
+            self.upstream.session_id = 0;
     }
 
     fn cleanup_stale_queries(self: *UDP, now: u64) void {
+        const was_idle = self.is_idle();
         if (self.query_list.count() == 0) {
             self.oldest_query_time = 0;
             return;
@@ -659,23 +750,25 @@ const UDP = struct {
             return;
 
         var oldest: u64 = 0;
-        var stale: std.ArrayListUnmanaged(u16) = .{};
-        defer stale.clearAndFree(g.allocator);
+        self.stale_buf.clearRetainingCapacity();
 
         var it = self.query_list.iterator();
         while (it.next()) |entry| {
             const qid = entry.key_ptr.*;
             const sent_at = entry.value_ptr.*;
             if (now - sent_at >= timeout_ms) {
-                stale.append(g.allocator, qid) catch unreachable;
+                self.stale_buf.append(g.allocator, qid) catch unreachable;
                 continue;
             }
             if (oldest == 0 or sent_at < oldest)
                 oldest = sent_at;
         }
 
-        for (stale.items) |qid|
+        for (self.stale_buf.items) |qid|
             _ = self.query_list.remove(qid);
+
+        if (!was_idle and self.is_idle())
+            self.session_node.on_idle();
 
         self.oldest_query_time = oldest;
     }
@@ -824,16 +917,20 @@ const TCP = struct {
     fdobj: ?*EvLoop.Fd = null, // tcp connection
     tls: TLS_ = .{}, // tls connection (DoT)
     send_list: MsgQueue = .{}, // qmsg to be sent
-    ack_list: std.AutoHashMapUnmanaged(u16, *RcMsg) = .{}, // qmsg to be ack
+    ack_list: std.AutoHashMapUnmanaged(u16, AckEntry) = .{}, // qmsg to be ack
+    stale_buf: std.ArrayListUnmanaged(u16) = .{},
     fd_canceled: bool = false,
     create_time: u64, // last connect time
     query_time: u64 = undefined, // last query time
+    oldest_query_time: u64 = 0, // oldest outstanding query time
     query_count: u16 = 0, // total query count
     pending_n: u16 = 0, // outstanding queries: send_list + ack_list
     active: u8 = 0, // running coroutines (query_sender/reply_receiver)
     flags: packed struct {
         freed: bool = false, // free()
         closing: bool = false, // close requested, waiting for active coroutines
+        freeing: bool = false, // guard re-entrant free during cancel
+        pending_free: bool = false,
         starting: bool = false, // start()
         stopping: bool = false, // stop()
         in_sender: bool = false, // query_sender()
@@ -942,6 +1039,11 @@ const TCP = struct {
         }
     };
 
+    const AckEntry = struct {
+        msg: *RcMsg,
+        sent_at: u64,
+    };
+
     pub fn new(upstream: *Upstream) *TCP {
         const self = g.allocator.create(TCP) catch unreachable;
         self.* = .{
@@ -952,25 +1054,36 @@ const TCP = struct {
     }
 
     pub fn free(self: *TCP) void {
+        if (!self.session_node.is_alive())
+            return;
         if (self.flags.freed) return;
-        if (self.active > 0) {
-            self.flags.closing = true;
-            if (self.upstream.session_eql(self))
-                self.upstream.session = null;
-            self.send_list.cancel_wait();
-            if (self.fdobj) |fdobj| if (!self.fd_canceled) {
-                fdobj.cancel();
-                self.fd_canceled = true;
-            };
+        if (self.flags.freeing) {
+            self.flags.pending_free = true;
             return;
         }
+        self.flags.freeing = true;
+        defer self.flags.freeing = false;
+        if (self.active > 0) {
+            self.flags.closing = true;
+            if (self.upstream.session_eql(self.session_node.id))
+                self.upstream.session_id = 0;
+            self.session_node.on_idle();
+            self.send_list.cancel_wait();
+            if (self.fdobj) |fdobj| if (!self.fd_canceled) {
+                self.fd_canceled = true;
+                fdobj.cancel();
+            };
+            if (self.active > 0)
+                return;
+        }
 
+        self.flags.pending_free = false;
         self.flags.freed = true;
 
         self.session_node.on_idle();
 
-        if (self.upstream.session_eql(self))
-            self.upstream.session = null;
+        if (self.upstream.session_eql(self.session_node.id))
+            self.upstream.session_id = 0;
 
         self.send_list.cancel_wait();
 
@@ -990,6 +1103,11 @@ const TCP = struct {
         self.send_list.clear();
         self.clear_ack_list(.unref);
         self.ack_list.clearAndFree(g.allocator);
+        self.stale_buf.clearAndFree(g.allocator);
+        self.session_node.mark_freed();
+        unregister_session(self.session_node.id);
+        self.session_node.id = 0;
+        g.allocator.destroy(self);
     }
 
     pub fn get_deadline(self: *const TCP) u64 {
@@ -1005,13 +1123,13 @@ const TCP = struct {
     /// no more queries will be sent. \
     /// freed when the queries completes.
     fn is_retire(self: *const TCP) bool {
-        if (!self.upstream.session_eql(self))
+        if (!self.upstream.session_eql(self.session_node.id))
             return true;
 
         if ((self.upstream.count > 0 and self.query_count >= self.upstream.count) or
             (self.upstream.life > 0 and g.evloop.time >= self.create_time + cc.to_u64(self.upstream.life) * 1000))
         {
-            self.upstream.session = null;
+            self.upstream.session_id = 0;
             return true;
         }
 
@@ -1025,9 +1143,9 @@ const TCP = struct {
         if (!self.upstream.can_try())
             return false;
 
-        if (self.is_retire()) {
+        if (self.is_idle() and self.is_retire()) {
             const new_session = new(self.upstream);
-            self.upstream.session = new_session;
+            install_session(self.upstream, new_session, .tcp);
 
             const ok = nosuspend new_session.send_query(qmsg);
             if (self.is_idle())
@@ -1082,20 +1200,32 @@ const TCP = struct {
     /// add qmsg to ack_list
     fn on_send_msg(self: *TCP, qmsg: *RcMsg) void {
         const qid = dns.get_id(qmsg.msg());
-        if (self.ack_list.fetchPut(g.allocator, qid, qmsg) catch unreachable) |old| {
-            old.value.unref();
-            self.pending_n -= 1;
-            assert(self.pending_n > 0);
+        const now = g.evloop.time;
+        if (self.ack_list.fetchPut(g.allocator, qid, .{ .msg = qmsg, .sent_at = now }) catch unreachable) |old| {
+            old.value.msg.unref();
+            if (self.pending_n > 0)
+                self.pending_n -= 1
+            else
+                self.pending_n = 0;
+            if (old.value.sent_at == self.oldest_query_time)
+                self.recalc_oldest_query_time();
             log.warn(@src(), "duplicated qid:%u to %s", .{ cc.to_uint(qid), self.upstream.url });
         }
+        if (self.oldest_query_time == 0 or now < self.oldest_query_time)
+            self.oldest_query_time = now;
     }
 
     /// remove qmsg from ack_list && qmsg.unref()
     fn on_recv_msg(self: *TCP, rmsg: *const RcMsg) void {
         const qid = dns.get_id(rmsg.msg());
         if (self.ack_list.fetchRemove(qid)) |kv| {
-            self.pending_n -= 1;
-            kv.value.unref();
+            if (self.pending_n > 0)
+                self.pending_n -= 1
+            else
+                self.pending_n = 0;
+            kv.value.msg.unref();
+            if (kv.value.sent_at == self.oldest_query_time)
+                self.recalc_oldest_query_time();
         } else {
             log.warn(@src(), "unexpected msg_id:%u from %s", .{ cc.to_uint(qid), self.upstream.url });
         }
@@ -1178,13 +1308,74 @@ const TCP = struct {
     fn clear_ack_list(self: *TCP, op: enum { resend, unref }) void {
         var it = self.ack_list.valueIterator();
         while (it.next()) |value_ptr| {
-            const qmsg = value_ptr.*;
+            const qmsg = value_ptr.msg;
             switch (op) {
                 .resend => self.send_list.push_front(qmsg),
                 .unref => qmsg.unref(),
             }
         }
         self.ack_list.clearRetainingCapacity();
+        self.oldest_query_time = 0;
+    }
+
+    fn recalc_oldest_query_time(self: *TCP) void {
+        var oldest: u64 = 0;
+        var it = self.ack_list.valueIterator();
+        while (it.next()) |value_ptr| {
+            const sent_at = value_ptr.sent_at;
+            if (oldest == 0 or sent_at < oldest)
+                oldest = sent_at;
+        }
+        self.oldest_query_time = oldest;
+    }
+
+    fn cleanup_stale_queries(self: *TCP, timer: *EvLoop.Timer) void {
+        if (self.ack_list.count() == 0) {
+            self.oldest_query_time = 0;
+            return;
+        }
+
+        const timeout_ms = cc.to_u64(g.upstream_timeout) * 1000;
+        if (timeout_ms == 0)
+            return;
+
+        if (self.oldest_query_time == 0)
+            self.recalc_oldest_query_time();
+        if (self.oldest_query_time == 0)
+            return;
+
+        if (!timer.check_deadline(self.oldest_query_time + timeout_ms))
+            return;
+
+        const now = g.evloop.time;
+        self.stale_buf.clearRetainingCapacity();
+
+        var oldest: u64 = 0;
+        var it = self.ack_list.iterator();
+        while (it.next()) |entry| {
+            const sent_at = entry.value_ptr.sent_at;
+            if (now - sent_at >= timeout_ms) {
+                self.stale_buf.append(g.allocator, entry.key_ptr.*) catch unreachable;
+                continue;
+            }
+            if (oldest == 0 or sent_at < oldest)
+                oldest = sent_at;
+        }
+
+        for (self.stale_buf.items) |qid| {
+            if (self.ack_list.fetchRemove(qid)) |kv| {
+                if (self.pending_n > 0)
+                    self.pending_n -= 1
+                else
+                    self.pending_n = 0;
+                kv.value.msg.unref();
+            }
+        }
+        self.stale_buf.clearRetainingCapacity();
+        self.oldest_query_time = oldest;
+
+        if (self.pending_n == 0)
+            self.session_node.on_idle();
     }
 
     /// may call `self.free()`

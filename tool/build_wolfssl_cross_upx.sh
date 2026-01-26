@@ -10,6 +10,8 @@ if [[ -z "$ZIG_BIN" ]]; then
     ZIG_BIN="$(command -v zig)"
   elif [[ -x /tmp/zig/zig-linux-x86_64-0.10.1/zig ]]; then
     ZIG_BIN="/tmp/zig/zig-linux-x86_64-0.10.1/zig"
+  elif [[ -x /tmp/zig-linux-x86_64-0.10.1/zig ]]; then
+    ZIG_BIN="/tmp/zig-linux-x86_64-0.10.1/zig"
   else
     echo "missing zig; set ZIG_BIN=/path/to/zig (or install zig)"; exit 1
   fi
@@ -22,6 +24,7 @@ command -v "$UPX_424_BIN" >/dev/null 2>&1 || { echo "missing $UPX_424_BIN"; exit
 OUT_AARCH64="chinadns-ng+wolfssl@aarch64-linux-musl@generic+v8a@fast+lto"
 OUT_ARM_V7A="chinadns-ng+wolfssl@arm-linux-musleabi@generic+v7a@fast+lto"
 OUT_ARM_V5TE="chinadns-ng+wolfssl@arm-linux-musleabi@generic+v5te+soft_float@fast+lto"
+OUT_AARCH64_DEBUG="chinadns-ng+wolfssl@aarch64-linux-musl@generic+v8a@debug"
 
 build_one() {
   local target="$1"
@@ -38,6 +41,21 @@ build_one() {
   chmod +x "dist/$out"
 }
 
+build_debug_one() {
+  local target="$1"
+  local cpu="$2"
+  local out="$3"
+  "$ZIG_BIN" build \
+    -Dwolfssl=true \
+    -Dtarget="$target" \
+    -Dcpu="$cpu" \
+    -Dmode=debug \
+    -Dlto=false \
+    -Dstrip=false
+  cp -f "zig-out/bin/$out" "dist/$out"
+  chmod +x "dist/$out"
+}
+
 mkdir -p dist
 
 echo "[build] $OUT_AARCH64"
@@ -48,6 +66,9 @@ build_one arm-linux-musleabi 'generic+v7a' "$OUT_ARM_V7A"
 
 echo "[build] $OUT_ARM_V5TE"
 build_one arm-linux-musleabi 'generic+v5te+soft_float' "$OUT_ARM_V5TE"
+
+echo "[build] $OUT_AARCH64_DEBUG (debug, no strip)"
+build_debug_one aarch64-linux-musl 'generic+v8a' "$OUT_AARCH64_DEBUG"
 
 OUT_AARCH64_UPX="${OUT_AARCH64}.upx"
 OUT_ARM_V7A_UPX="${OUT_ARM_V7A}.upx"
@@ -70,6 +91,7 @@ sha256sum \
   "dist/$OUT_AARCH64" \
   "dist/$OUT_ARM_V7A" \
   "dist/$OUT_ARM_V5TE" \
+  "dist/$OUT_AARCH64_DEBUG" \
   "dist/$OUT_AARCH64_UPX" \
   "dist/$OUT_ARM_V7A_UPX" \
   "dist/$OUT_ARM_V5TE_UPX" \
@@ -80,6 +102,7 @@ ls -la \
   "dist/$OUT_AARCH64" \
   "dist/$OUT_ARM_V7A" \
   "dist/$OUT_ARM_V5TE" \
+  "dist/$OUT_AARCH64_DEBUG" \
   "dist/$OUT_AARCH64_UPX" \
   "dist/$OUT_ARM_V7A_UPX" \
   "dist/$OUT_ARM_V5TE_UPX" \

@@ -7,6 +7,7 @@ const opt = @import("opt.zig");
 const dnl = @import("dnl.zig");
 const ipset = @import("ipset.zig");
 const Tag = @import("tag.zig").Tag;
+const EvLoop = @import("EvLoop.zig");
 const DynStr = @import("DynStr.zig");
 const StrList = @import("StrList.zig");
 const Upstream = @import("Upstream.zig");
@@ -188,6 +189,16 @@ pub fn require_ip_test() bool {
             return true;
     }
     return false;
+}
+
+// ========================================================
+
+pub fn check_timeout(timer: *EvLoop.Timer) void {
+    for (_all_groups) |*group| {
+        for (group.upstream_group.items()) |*upstream| {
+            Upstream.check_timeout_upstream(upstream, timer);
+        }
+    }
 }
 
 // ========================================================
