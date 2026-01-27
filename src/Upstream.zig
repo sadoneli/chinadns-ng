@@ -152,10 +152,24 @@ fn deinit(self: *const Upstream) void {
 
 var _session_table: std.AutoHashMapUnmanaged(u32, SessionMeta) = .{};
 var _session_next_id: u32 = 1;
+var _session_ptrs: std.AutoHashMapUnmanaged(usize, void) = .{};
+var _free_udp: ?*UDP = null;
+var _free_tcp: ?*TCP = null;
 
 pub fn module_init() void {
     _session_table = .{};
     _session_next_id = 1;
+    _session_ptrs = .{};
+    _free_udp = null;
+    _free_tcp = null;
+}
+
+fn register_session_ptr(ptr: anytype) void {
+    _ = _session_ptrs.put(g.allocator, @ptrToInt(ptr), {}) catch unreachable;
+}
+
+fn is_session_ptr_known(ptr: *anyopaque) bool {
+    return _session_ptrs.contains(@ptrToInt(ptr));
 }
 
 fn register_session(ptr: anytype, upstream: *Upstream, kind: SessionKind) u32 {
@@ -168,10 +182,13 @@ fn register_session(ptr: anytype, upstream: *Upstream, kind: SessionKind) u32 {
         .upstream = upstream,
         .kind = kind,
     }) catch unreachable;
+    register_session_ptr(ptr);
     return id;
 }
 
 fn unregister_session(id: u32) void {
+    if (id == 0)
+        return;
     _ = _session_table.remove(id);
 }
 
@@ -213,8 +230,20 @@ fn tcp_session(self: *Upstream) ?*TCP {
 fn get_session(self: *Upstream, comptime T: type, kind: SessionKind) ?*T {
     if (self.session_id != 0) {
         if (_session_table.get(self.session_id)) |meta| {
+            if (!is_session_ptr_known(meta.ptr)) {
+                log.err(@src(), "session ptr missing, reset: %u", .{cc.to_uint(self.session_id)});
+                unregister_session(self.session_id);
+                self.session_id = 0;
+                return null;
+            }
             if (meta.upstream == self and session_kind_matches(T, meta.kind)) {
-                return cc.ptrcast(*T, meta.ptr);
+                const session = cc.ptrcast(*T, meta.ptr);
+                if (session.session_node.is_alive() and session.session_node.id == self.session_id)
+                    return session;
+                log.err(@src(), "session stale, reset: %u", .{cc.to_uint(self.session_id)});
+                unregister_session(self.session_id);
+                self.session_id = 0;
+                return null;
             }
             log.err(@src(), "session id mismatch, reset: %u", .{cc.to_uint(self.session_id)});
         } else {
@@ -289,6 +318,12 @@ pub fn check_timeout_upstream(upstream: *Upstream, timer: *EvLoop.Timer) void {
     switch (meta.kind) {
         .udp => {
             const session = cc.ptrcast(*UDP, meta.ptr);
+            if (!is_session_ptr_known(meta.ptr) or !session.session_node.is_alive() or session.session_node.id != session_id) {
+                log.err(@src(), "timeout session stale, reset: %u", .{cc.to_uint(session_id)});
+                unregister_session(session_id);
+                upstream.session_id = 0;
+                return;
+            }
             if (session.is_idle())
                 return;
             if (timer.check_deadline(session.get_deadline()))
@@ -296,6 +331,12 @@ pub fn check_timeout_upstream(upstream: *Upstream, timer: *EvLoop.Timer) void {
         },
         .tcp => {
             const session = cc.ptrcast(*TCP, meta.ptr);
+            if (!is_session_ptr_known(meta.ptr) or !session.session_node.is_alive() or session.session_node.id != session_id) {
+                log.err(@src(), "timeout session stale, reset: %u", .{cc.to_uint(session_id)});
+                unregister_session(session_id);
+                upstream.session_id = 0;
+                return;
+            }
             session.cleanup_stale_queries(timer);
             if (session.is_idle())
                 return;
@@ -353,6 +394,7 @@ const SessionNode = struct {
 /// udp session
 const UDP = struct {
     session_node: SessionNode = .{ .type = .udp }, // _session_list node
+    free_next: ?*UDP = null,
     upstream: *Upstream,
     fdobj: *EvLoop.Fd,
     proxy_fdobj: ?*EvLoop.Fd = null, // socks5 tcp control channel (UDP ASSOCIATE)
@@ -378,10 +420,23 @@ const UDP = struct {
     proxy_prefix_len: u8 = 0,
 
     pub fn new(upstream: *Upstream) ?*UDP {
-        const self = g.allocator.create(UDP) catch unreachable;
+        var reused = false;
+        const self = if (_free_udp) |node| b: {
+            _free_udp = node.free_next;
+            reused = true;
+            break :b node;
+        } else g.allocator.create(UDP) catch unreachable;
         self.* = .{ .upstream = upstream, .fdobj = undefined, .create_time = g.evloop.time };
 
-        errdefer g.allocator.destroy(self);
+        errdefer {
+            if (reused) {
+                self.session_node.mark_freed();
+                self.free_next = _free_udp;
+                _free_udp = self;
+            } else {
+                g.allocator.destroy(self);
+            }
+        }
 
         self.proxy_enabled = use_proxy(upstream);
 
@@ -393,6 +448,7 @@ const UDP = struct {
         const fd = net.new_sock(family, .udp) orelse return null;
         self.fdobj = EvLoop.Fd.new(fd);
 
+        register_session_ptr(self);
         return self;
     }
 
@@ -400,6 +456,8 @@ const UDP = struct {
     /// - reply_receiver
     /// - check_timeout
     fn free(self: *UDP) void {
+        if (!is_session_ptr_known(@ptrCast(*anyopaque, self)))
+            return;
         if (!self.session_node.is_alive())
             return;
         if (self.freed) return;
@@ -466,7 +524,8 @@ const UDP = struct {
         self.session_node.mark_freed();
         unregister_session(self.session_node.id);
         self.session_node.id = 0;
-        g.allocator.destroy(self);
+        self.free_next = _free_udp;
+        _free_udp = self;
     }
 
     pub fn get_deadline(self: *const UDP) u64 {
@@ -476,6 +535,8 @@ const UDP = struct {
 
     /// [nosuspend]
     pub fn send_query(self: *UDP, qmsg: *RcMsg) bool {
+        if (!is_session_ptr_known(@ptrCast(*anyopaque, self)) or !self.session_node.is_alive())
+            return false;
         const limit = pending_limit();
         if (self.query_list.count() >= limit) {
             log.warn(@src(), "too many pending udp queries to %s: %u (limit:%u)", .{
@@ -913,6 +974,7 @@ pub const TLS = struct {
 /// tcp/tls session
 const TCP = struct {
     session_node: SessionNode = .{ .type = .tcp }, // _session_list node
+    free_next: ?*TCP = null,
     upstream: *Upstream,
     fdobj: ?*EvLoop.Fd = null, // tcp connection
     tls: TLS_ = .{}, // tls connection (DoT)
@@ -1045,15 +1107,24 @@ const TCP = struct {
     };
 
     pub fn new(upstream: *Upstream) *TCP {
-        const self = g.allocator.create(TCP) catch unreachable;
+        var reused = false;
+        const self = if (_free_tcp) |node| b: {
+            _free_tcp = node.free_next;
+            reused = true;
+            break :b node;
+        } else g.allocator.create(TCP) catch unreachable;
         self.* = .{
             .upstream = upstream,
             .create_time = g.evloop.time,
         };
+        if (!reused)
+            register_session_ptr(self);
         return self;
     }
 
     pub fn free(self: *TCP) void {
+        if (!is_session_ptr_known(@ptrCast(*anyopaque, self)))
+            return;
         if (!self.session_node.is_alive())
             return;
         if (self.flags.freed) return;
@@ -1107,7 +1178,8 @@ const TCP = struct {
         self.session_node.mark_freed();
         unregister_session(self.session_node.id);
         self.session_node.id = 0;
-        g.allocator.destroy(self);
+        self.free_next = _free_tcp;
+        _free_tcp = self;
     }
 
     pub fn get_deadline(self: *const TCP) u64 {
@@ -1138,6 +1210,8 @@ const TCP = struct {
 
     /// add to send queue, `qmsg.ref++`
     pub fn send_query(self: *TCP, qmsg: *RcMsg) bool {
+        if (!is_session_ptr_known(@ptrCast(*anyopaque, self)) or !self.session_node.is_alive())
+            return false;
         const proxied = use_proxy(self.upstream);
 
         if (!self.upstream.can_try())
