@@ -232,6 +232,23 @@ const Query = struct {
             assert(self.map.remove(q.qid));
             q.node.unlink();
             q.free();
+
+            // Shrink map if capacity is too large (count < 12.5% of capacity and capacity > 256)
+            const cap = self.map.capacity();
+            const cnt = self.map.count();
+            if (cap > 256 and cnt * 8 < cap) {
+                self.shrink();
+            }
+        }
+
+        fn shrink(self: *List) void {
+            var new_map: @TypeOf(self.map) = .{};
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                new_map.put(g.allocator, entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+            self.map.deinit(g.allocator);
+            self.map = new_map;
         }
     };
 };

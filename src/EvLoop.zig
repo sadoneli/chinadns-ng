@@ -339,7 +339,12 @@ fn apply_change(self: *EvLoop) void {
             assert(self.ev_mod(fdobj, new_events));
         }
     }
-    self.change_list.clearRetainingCapacity();
+    // Shrink change_list if capacity is too large
+    if (self.change_list.capacity() > 64 and self.change_list.count() == 0) {
+        self.change_list.clearAndFree(g.allocator);
+    } else {
+        self.change_list.clearRetainingCapacity();
+    }
 }
 
 fn on_close_fd(self: *EvLoop, fdobj: *const Fd) void {
@@ -387,7 +392,12 @@ pub fn run(self: *EvLoop) void {
         nosuspend root.call_module_fn(.check_timeout, .{&timer});
 
         // empty the list before starting a new epoll_wait
-        self.destroyed.clearRetainingCapacity();
+        // Shrink destroyed map if capacity is too large
+        if (self.destroyed.capacity() > 64 and self.destroyed.count() == 0) {
+            self.destroyed.clearAndFree(g.allocator);
+        } else {
+            self.destroyed.clearRetainingCapacity();
+        }
 
         // apply the event changes (epoll_ctl)
         self.apply_change();

@@ -161,7 +161,24 @@ pub fn module_init() void {
     _session_slots.deinit(g.allocator);
     _session_slots = .{};
     _session_free = null;
+    _session_ptrs.deinit(g.allocator);
     _session_ptrs = .{};
+}
+
+/// Shrink global session data structures if they are over-allocated
+pub fn shrink_memory() void {
+    // Shrink _session_ptrs if very sparse (count < 25% of capacity and capacity > 64)
+    const cap = _session_ptrs.capacity();
+    const cnt = _session_ptrs.count();
+    if (cap > 64 and cnt * 4 < cap) {
+        var new_ptrs: @TypeOf(_session_ptrs) = .{};
+        var it = _session_ptrs.iterator();
+        while (it.next()) |entry| {
+            new_ptrs.put(g.allocator, entry.key_ptr.*, entry.value_ptr.*) catch {};
+        }
+        _session_ptrs.deinit(g.allocator);
+        _session_ptrs = new_ptrs;
+    }
 }
 
 inline fn make_session_handle(index: u32, generation: u32) SessionHandle {
@@ -296,6 +313,7 @@ fn get_session(self: *Upstream, comptime T: type, kind: SessionKind) ?*T {
             };
             if (handle != self.session_id) {
                 log.err(@src(), "session ptr mismatch, reset: %llu", .{cc.to_ulonglong(self.session_id)});
+                unregister_session_ptr(slot.ptr.?);
                 release_session_slot(self.session_id);
                 self.session_id = 0;
                 return null;
@@ -383,6 +401,7 @@ pub fn check_timeout_upstream(upstream: *Upstream, timer: *EvLoop.Timer) void {
     };
     if (handle != session_id) {
         log.err(@src(), "timeout session ptr mismatch, reset: %llu", .{cc.to_ulonglong(session_id)});
+        unregister_session_ptr(slot.ptr.?);
         release_session_slot(session_id);
         upstream.session_id = 0;
         return;
@@ -763,6 +782,7 @@ const UDP = struct {
         var ok = false;
         defer if (!ok) {
             pfdobj.cancel();
+            pfdobj.free();
         };
 
         g.evloop.connect(pfdobj, &proxy_addr) orelse {
@@ -818,6 +838,7 @@ const UDP = struct {
 
         const n = socks5.build_udp_datagram_prefix(&self.proxy_prefix, &self.upstream.addr) orelse {
             g.proxy_note_fail();
+            drop_pending(self);
             return;
         };
         self.proxy_prefix_len = cc.to_u8(n);
@@ -880,7 +901,12 @@ const UDP = struct {
             return;
 
         var oldest: u64 = 0;
-        self.stale_buf.clearRetainingCapacity();
+        // Shrink stale_buf if capacity is too large
+        if (self.stale_buf.capacity > 64 and self.stale_buf.items.len == 0) {
+            self.stale_buf.clearAndFree(g.allocator);
+        } else {
+            self.stale_buf.clearRetainingCapacity();
+        }
 
         var it = self.query_list.iterator();
         while (it.next()) |entry| {
@@ -1261,18 +1287,20 @@ const TCP = struct {
 
     /// no more queries will be sent. \
     /// freed when the queries completes.
-    fn is_retire(self: *const TCP) bool {
+    fn should_retire(self: *const TCP) bool {
         if (!self.upstream.session_eql(self.session_node.id))
             return true;
 
         if ((self.upstream.count > 0 and self.query_count >= self.upstream.count) or
             (self.upstream.life > 0 and g.evloop.time >= self.create_time + cc.to_u64(self.upstream.life) * 1000))
-        {
-            self.upstream.session_id = 0;
             return true;
-        }
 
         return false;
+    }
+
+    fn retire(self: *const TCP) void {
+        if (self.upstream.session_eql(self.session_node.id))
+            self.upstream.session_id = 0;
     }
 
     /// add to send queue, `qmsg.ref++`
@@ -1284,7 +1312,8 @@ const TCP = struct {
         if (!self.upstream.can_try())
             return false;
 
-        if (self.is_idle() and self.is_retire()) {
+        if (self.is_idle() and self.should_retire()) {
+            self.retire();
             const new_session = new(self.upstream);
             install_session(self.upstream, new_session, .tcp);
 
@@ -1441,8 +1470,10 @@ const TCP = struct {
             }
         } else {
             // idle
-            if (!self.flags.starting and self.is_retire())
+            if (!self.flags.starting and self.should_retire()) {
+                self.retire();
                 self.free();
+            }
         }
     }
 
@@ -1455,7 +1486,12 @@ const TCP = struct {
                 .unref => qmsg.unref(),
             }
         }
-        self.ack_list.clearRetainingCapacity();
+        // Shrink ack_list if capacity is too large
+        if (self.ack_list.capacity() > 64 and self.ack_list.count() == 0) {
+            self.ack_list.clearAndFree(g.allocator);
+        } else {
+            self.ack_list.clearRetainingCapacity();
+        }
         self.oldest_query_time = 0;
     }
 
@@ -1489,7 +1525,12 @@ const TCP = struct {
             return;
 
         const now = g.evloop.time;
-        self.stale_buf.clearRetainingCapacity();
+        // Shrink stale_buf if capacity is too large
+        if (self.stale_buf.capacity > 64 and self.stale_buf.items.len == 0) {
+            self.stale_buf.clearAndFree(g.allocator);
+        } else {
+            self.stale_buf.clearRetainingCapacity();
+        }
 
         var oldest: u64 = 0;
         var it = self.ack_list.iterator();
@@ -1512,7 +1553,12 @@ const TCP = struct {
                 kv.value.msg.unref();
             }
         }
-        self.stale_buf.clearRetainingCapacity();
+        // Shrink stale_buf after use if it grew large
+        if (self.stale_buf.capacity > 64) {
+            self.stale_buf.clearAndFree(g.allocator);
+        } else {
+            self.stale_buf.clearRetainingCapacity();
+        }
         self.oldest_query_time = oldest;
 
         if (self.pending_n == 0)
@@ -1532,8 +1578,10 @@ const TCP = struct {
         co.start(query_sender, .{self});
         self.flags.starting = false;
 
-        if (self.is_idle() and self.is_retire())
+        if (self.is_idle() and self.should_retire()) {
+            self.retire();
             self.free();
+        }
     }
 
     fn query_sender(self: *TCP) void {
@@ -1642,8 +1690,10 @@ const TCP = struct {
                 if (!prev_idle)
                     self.session_node.on_idle();
 
-                if (self.is_retire())
+                if (self.should_retire()) {
+                    self.retire();
                     return; // stop and free
+                }
             }
         }
     }
