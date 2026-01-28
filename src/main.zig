@@ -251,6 +251,12 @@ pub fn main() u8 {
     if (g.flags.reuse_port)
         log.info(src, "SO_REUSEPORT for listening socket", .{});
 
+    if (g.tcp_conn_max > 0)
+        log.info(src, "tcp client conn max: %u", .{cc.to_uint(g.tcp_conn_max)});
+
+    if (g.tcp_idle_sec > 0)
+        log.info(src, "tcp client idle timeout: %us", .{cc.to_uint(g.tcp_idle_sec)});
+
     if (g.verbose())
         log.info(src, "printing the verbose runtime log", .{});
 

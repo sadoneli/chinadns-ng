@@ -58,6 +58,12 @@ pub var pending_query_max: u32 = 4096;
 /// per-upstream pending upper bound (per session, tcp/udp)
 pub var upstream_pending_max: u32 = 2048;
 
+/// max concurrent tcp client connections (0 = unlimited)
+pub var tcp_conn_max: u32 = 256;
+
+/// tcp client idle timeout in seconds (0 = disable)
+pub var tcp_idle_sec: u32 = 60;
+
 /// consecutive failures before marking an upstream temporarily down
 pub var upstream_fail_threshold: u8 = 3;
 

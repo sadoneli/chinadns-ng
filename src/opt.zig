@@ -56,6 +56,8 @@ const help =
 \\ --proxy-protocol <list>              proxy only these upstream protos: tcp,tls,udp
 \\ --pending-max <N>                    global pending queries upper bound (default: 4096)
 \\ --upstream-pending-max <N>           per-upstream pending upper bound (default: 2048)
+\\ --tcp-conn-max <N>                   max concurrent tcp client connections (default: 256, 0=unlimited)
+\\ --tcp-idle-sec <sec>                 tcp client idle timeout (default: 60, 0=disable)
 \\ --upstream-fail-threshold <N>        consecutive fails before marking upstream down (default: 3)
 \\ --upstream-down-ms <ms>              initial circuit-breaker down duration (default: 10000, max 60000)
 \\ --socket-backoff-ms <ms>             EMFILE backoff window (default: 10000)
@@ -161,6 +163,8 @@ const optdef_array = [_]OptDef{
     .{ .short = "",  .long = "proxy-protocol",     .value = .required, .optfn = opt_proxy_protocol,     },
     .{ .short = "",  .long = "pending-max",        .value = .required, .optfn = opt_pending_max,        },
     .{ .short = "",  .long = "upstream-pending-max", .value = .required, .optfn = opt_upstream_pending_max, },
+    .{ .short = "",  .long = "tcp-conn-max",       .value = .required, .optfn = opt_tcp_conn_max,       },
+    .{ .short = "",  .long = "tcp-idle-sec",       .value = .required, .optfn = opt_tcp_idle_sec,       },
     .{ .short = "",  .long = "upstream-fail-threshold", .value = .required, .optfn = opt_upstream_fail_threshold, },
     .{ .short = "",  .long = "upstream-down-ms",   .value = .required, .optfn = opt_upstream_down_ms,   },
     .{ .short = "",  .long = "socket-backoff-ms",  .value = .required, .optfn = opt_socket_backoff_ms,  },
@@ -674,6 +678,18 @@ fn opt_upstream_pending_max(in_value: ?[]const u8) void {
     const parsed = str2int.parse(u32, value, 10) orelse invalid_optvalue(@src(), value);
     if (parsed == 0) invalid_optvalue(@src(), value);
     g.upstream_pending_max = parsed;
+}
+
+fn opt_tcp_conn_max(in_value: ?[]const u8) void {
+    const value = in_value.?;
+    const parsed = str2int.parse(u32, value, 10) orelse invalid_optvalue(@src(), value);
+    g.tcp_conn_max = parsed;
+}
+
+fn opt_tcp_idle_sec(in_value: ?[]const u8) void {
+    const value = in_value.?;
+    const parsed = str2int.parse(u32, value, 10) orelse invalid_optvalue(@src(), value);
+    g.tcp_idle_sec = parsed;
 }
 
 fn opt_upstream_fail_threshold(in_value: ?[]const u8) void {

@@ -239,6 +239,39 @@ const Query = struct {
 /// qid => *query(q)
 var _query_list: Query.List = undefined;
 
+const TcpConn = struct {
+    node: Node = undefined,
+    fdobj: *EvLoop.Fd,
+    last_active: u64,
+    closing: bool = false,
+
+    pub fn from_node(node: *Node) *TcpConn {
+        return @fieldParentPtr(TcpConn, "node", node);
+    }
+
+    pub fn touch(self: *TcpConn) void {
+        self.last_active = g.evloop.time;
+    }
+
+    pub fn get_deadline(self: *const TcpConn) ?u64 {
+        if (g.tcp_idle_sec == 0)
+            return null;
+        return self.last_active + cc.to_u64(g.tcp_idle_sec) * 1000;
+    }
+
+    pub fn on_timeout(self: *TcpConn) void {
+        if (self.closing)
+            return;
+        self.closing = true;
+        self.fdobj.cancel();
+    }
+};
+
+var _tcp_conn_list: Node = undefined;
+var _tcp_conn_active: u32 = 0;
+var _tcp_conn_drop_counter: u32 = 0;
+var _tcp_conn_drop_last_ms: u64 = 0;
+
 // =======================================================================================================
 
 fn tcp_listener(fd: c_int, ip: cc.ConstStr, port: u16) void {
@@ -261,6 +294,21 @@ fn tcp_listener(fd: c_int, ip: cc.ConstStr, port: u16) void {
             continue;
         };
         net.setup_tcp_conn_sock(conn_fd);
+        if (g.tcp_conn_max > 0 and _tcp_conn_active >= g.tcp_conn_max) {
+            _tcp_conn_drop_counter +|= 1;
+            const now = g.evloop.time;
+            const window_ms: u64 = 2000;
+            if (now - _tcp_conn_drop_last_ms >= window_ms) {
+                _tcp_conn_drop_last_ms = now;
+                log.warn(@src(), "drop tcp connection: too many active (%u) [cnt:%u]", .{
+                    cc.to_uint(_tcp_conn_active),
+                    cc.to_uint(_tcp_conn_drop_counter),
+                });
+                _tcp_conn_drop_counter = 0;
+            }
+            _ = cc.close(conn_fd);
+            continue;
+        }
         co.start(tcp_server, .{ conn_fd, &src_addr });
     }
 }
@@ -269,7 +317,17 @@ fn tcp_server(fd: c_int, p_src_addr: *const cc.SockAddr) void {
     defer co.terminate(@frame(), @frameSize(tcp_server));
 
     const fdobj = EvLoop.Fd.new(fd);
-    defer fdobj.free();
+    const conn = g.allocator.create(TcpConn) catch unreachable;
+    conn.* = .{ .fdobj = fdobj, .last_active = g.evloop.time };
+    _tcp_conn_active +|= 1;
+    _tcp_conn_list.link_to_tail(&conn.node);
+    defer {
+        conn.node.unlink();
+        if (_tcp_conn_active > 0)
+            _tcp_conn_active -= 1;
+        g.allocator.destroy(conn);
+        fdobj.free();
+    }
 
     // copy to local variable
     const src_addr = p_src_addr.*;
@@ -293,6 +351,8 @@ fn tcp_server(fd: c_int, p_src_addr: *const cc.SockAddr) void {
             g.evloop.read(fdobj, std.mem.asBytes(&len)) catch |err| switch (err) {
                 error.eof => return,
                 error.errno => {
+                    if (fdobj.is_canceled())
+                        return;
                     // global throttle: log once per window with aggregated count
                     g.tcp_read_err_counter +|= 1;
                     const now = g.evloop.time;
@@ -305,6 +365,7 @@ fn tcp_server(fd: c_int, p_src_addr: *const cc.SockAddr) void {
                     break :e .{ .op = "read_len" };
                 },
             };
+            conn.touch();
 
             len = cc.ntohs(len);
             if (len < 1 or len > c.DNS_QMSG_MAXSIZE) {
@@ -333,8 +394,13 @@ fn tcp_server(fd: c_int, p_src_addr: *const cc.SockAddr) void {
             qmsg.len = len;
             g.evloop.read(fdobj, qmsg.msg()) catch |err| switch (err) {
                 error.eof => break :e .{ .op = "read_msg", .msg = "connection closed" },
-                error.errno => break :e .{ .op = "read_msg" },
+                error.errno => {
+                    if (fdobj.is_canceled())
+                        return;
+                    break :e .{ .op = "read_msg" };
+                },
             };
+            conn.touch();
 
             nosuspend on_query(qmsg, fdobj, &src_addr, .{ .from = .tcp });
         }
@@ -1244,6 +1310,16 @@ pub fn check_timeout(timer: *EvLoop.Timer) void {
             break;
     }
 
+    // check tcp connections (idle)
+    var conn_it = _tcp_conn_list.iterator();
+    while (conn_it.next()) |node| {
+        const conn = TcpConn.from_node(node);
+        if (conn.get_deadline()) |deadline| {
+            if (timer.check_deadline(deadline))
+                nosuspend conn.on_timeout();
+        }
+    }
+
     // check query_list
     var it = _query_list.list.iterator();
     while (it.next()) |q_node| {
@@ -1286,6 +1362,8 @@ noinline fn do_start(ip: cc.ConstStr, port: u16, socktype: net.SockType) void {
 pub fn start() void {
     _query_list.init();
     _tcp_sender.init();
+    _tcp_conn_list.init();
+    _tcp_conn_active = 0;
 
     for (g.bind_ips.items()) |ip| {
         for (g.bind_ports) |p| {
