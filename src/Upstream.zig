@@ -19,11 +19,14 @@ const assert = std.debug.assert;
 
 const session_magic_alive: u32 = 0x53455353; // "SESS"
 const session_magic_freed: u32 = 0xDEAD5E55;
+const SessionHandle = u64;
 const SessionKind = enum { udp, tcp };
-const SessionMeta = struct {
-    ptr: *anyopaque,
-    upstream: *Upstream,
-    kind: SessionKind,
+const SessionSlot = struct {
+    ptr: ?*anyopaque = null,
+    upstream: ?*Upstream = null,
+    kind: SessionKind = .udp,
+    generation: u32 = 1,
+    next_free: ?u32 = null,
 };
 
 fn use_proxy(upstream: *const Upstream) bool {
@@ -60,8 +63,8 @@ comptime {
 
 const Upstream = @This();
 
-// session id (0 means none)
-session_id: u32 = 0,
+// session handle (0 means none)
+session_id: SessionHandle = 0,
 
 // config
 host: ?cc.ConstStr, // DoT SNI
@@ -150,52 +153,106 @@ fn deinit(self: *const Upstream) void {
 
 // ======================================================
 
-var _session_table: std.AutoHashMapUnmanaged(u32, SessionMeta) = .{};
-var _session_next_id: u32 = 1;
-var _session_ptrs: std.AutoHashMapUnmanaged(usize, void) = .{};
-var _free_udp: ?*UDP = null;
-var _free_tcp: ?*TCP = null;
+var _session_slots: std.ArrayListUnmanaged(SessionSlot) = .{};
+var _session_free: ?u32 = null;
+var _session_ptrs: std.AutoHashMapUnmanaged(usize, SessionHandle) = .{};
 
 pub fn module_init() void {
-    _session_table = .{};
-    _session_next_id = 1;
+    _session_slots.deinit(g.allocator);
+    _session_slots = .{};
+    _session_free = null;
     _session_ptrs = .{};
-    _free_udp = null;
-    _free_tcp = null;
 }
 
-fn register_session_ptr(ptr: anytype) void {
-    _ = _session_ptrs.put(g.allocator, @ptrToInt(ptr), {}) catch unreachable;
+inline fn make_session_handle(index: u32, generation: u32) SessionHandle {
+    return (@as(SessionHandle, generation) << 32) | @as(SessionHandle, index);
 }
 
-fn is_session_ptr_known(ptr: *anyopaque) bool {
-    return _session_ptrs.contains(@ptrToInt(ptr));
+inline fn session_handle_index(handle: SessionHandle) u32 {
+    return @intCast(u32, handle & 0xffff_ffff);
 }
 
-fn register_session(ptr: anytype, upstream: *Upstream, kind: SessionKind) u32 {
-    var id = _session_next_id;
-    _session_next_id +%= 1;
-    if (_session_next_id == 0)
-        _session_next_id = 1;
-    _session_table.put(g.allocator, id, .{
+inline fn session_handle_generation(handle: SessionHandle) u32 {
+    return @intCast(u32, handle >> 32);
+}
+
+fn allocate_session_slot(ptr: anytype, upstream: *Upstream, kind: SessionKind) SessionHandle {
+    var index: u32 = undefined;
+    if (_session_free) |free_index| {
+        index = free_index;
+        var slot = &_session_slots.items[index];
+        _session_free = slot.next_free;
+        slot.next_free = null;
+        slot.ptr = @ptrCast(*anyopaque, ptr);
+        slot.upstream = upstream;
+        slot.kind = kind;
+        if (slot.generation == 0)
+            slot.generation = 1;
+        return make_session_handle(index, slot.generation);
+    }
+
+    assert(_session_slots.items.len < std.math.maxInt(u32));
+    index = @intCast(u32, _session_slots.items.len);
+    _session_slots.append(g.allocator, .{
         .ptr = @ptrCast(*anyopaque, ptr),
         .upstream = upstream,
         .kind = kind,
+        .generation = 1,
+        .next_free = null,
     }) catch unreachable;
-    register_session_ptr(ptr);
-    return id;
+    return make_session_handle(index, 1);
 }
 
-fn unregister_session(id: u32) void {
-    if (id == 0)
+fn release_session_slot(handle: SessionHandle) void {
+    if (handle == 0)
         return;
-    _ = _session_table.remove(id);
+    const index = session_handle_index(handle);
+    if (index >= _session_slots.items.len)
+        return;
+    var slot = &_session_slots.items[index];
+    if (slot.generation != session_handle_generation(handle))
+        return;
+    slot.ptr = null;
+    slot.upstream = null;
+    slot.kind = .udp;
+    slot.generation +%= 1;
+    if (slot.generation == 0)
+        slot.generation = 1;
+    slot.next_free = _session_free;
+    _session_free = index;
+}
+
+fn get_session_slot(handle: SessionHandle) ?*SessionSlot {
+    if (handle == 0)
+        return null;
+    const index = session_handle_index(handle);
+    if (index >= _session_slots.items.len)
+        return null;
+    const slot = &_session_slots.items[index];
+    if (slot.ptr == null)
+        return null;
+    if (slot.generation != session_handle_generation(handle))
+        return null;
+    return slot;
+}
+
+fn register_session_ptr(ptr: anytype, handle: SessionHandle) void {
+    _ = _session_ptrs.put(g.allocator, @ptrToInt(ptr), handle) catch unreachable;
+}
+
+fn unregister_session_ptr(ptr: anytype) void {
+    _ = _session_ptrs.remove(@ptrToInt(ptr));
+}
+
+fn get_session_ptr_handle(ptr: *anyopaque) ?SessionHandle {
+    return _session_ptrs.get(@ptrToInt(ptr));
 }
 
 fn install_session(upstream: *Upstream, session: anytype, kind: SessionKind) void {
-    const id = register_session(session, upstream, kind);
-    session.session_node.id = id;
-    upstream.session_id = id;
+    const handle = allocate_session_slot(session, upstream, kind);
+    register_session_ptr(session, handle);
+    session.session_node.id = handle;
+    upstream.session_id = handle;
 }
 
 fn session_kind_matches(comptime T: type, kind: SessionKind) bool {
@@ -229,25 +286,32 @@ fn tcp_session(self: *Upstream) ?*TCP {
 
 fn get_session(self: *Upstream, comptime T: type, kind: SessionKind) ?*T {
     if (self.session_id != 0) {
-        if (_session_table.get(self.session_id)) |meta| {
-            if (!is_session_ptr_known(meta.ptr)) {
-                log.err(@src(), "session ptr missing, reset: %u", .{cc.to_uint(self.session_id)});
-                unregister_session(self.session_id);
+        if (get_session_slot(self.session_id)) |slot| {
+            const handle = get_session_ptr_handle(slot.ptr.?) orelse {
+                log.err(@src(), "session ptr missing, reset: %llu", .{cc.to_ulonglong(self.session_id)});
+                unregister_session_ptr(slot.ptr.?);
+                release_session_slot(self.session_id);
+                self.session_id = 0;
+                return null;
+            };
+            if (handle != self.session_id) {
+                log.err(@src(), "session ptr mismatch, reset: %llu", .{cc.to_ulonglong(self.session_id)});
+                release_session_slot(self.session_id);
                 self.session_id = 0;
                 return null;
             }
-            if (meta.upstream == self and session_kind_matches(T, meta.kind)) {
-                const session = cc.ptrcast(*T, meta.ptr);
+            if (slot.upstream != null and slot.upstream.? == self and session_kind_matches(T, slot.kind)) {
+                const session = cc.ptrcast(*T, slot.ptr.?);
                 if (session.session_node.is_alive() and session.session_node.id == self.session_id)
                     return session;
-                log.err(@src(), "session stale, reset: %u", .{cc.to_uint(self.session_id)});
-                unregister_session(self.session_id);
+                log.err(@src(), "session stale, reset: %llu", .{cc.to_ulonglong(self.session_id)});
+                release_session_slot(self.session_id);
                 self.session_id = 0;
                 return null;
             }
-            log.err(@src(), "session id mismatch, reset: %u", .{cc.to_uint(self.session_id)});
+            log.err(@src(), "session id mismatch, reset: %llu", .{cc.to_ulonglong(self.session_id)});
         } else {
-            log.err(@src(), "session id missing, reset: %u", .{cc.to_uint(self.session_id)});
+            log.err(@src(), "session id missing, reset: %llu", .{cc.to_ulonglong(self.session_id)});
         }
         self.session_id = 0;
     }
@@ -263,7 +327,7 @@ fn get_session(self: *Upstream, comptime T: type, kind: SessionKind) ?*T {
     return null;
 }
 
-fn session_eql(self: *const Upstream, session_id: u32) bool {
+fn session_eql(self: *const Upstream, session_id: SessionHandle) bool {
     return session_id != 0 and self.session_id == session_id;
 }
 
@@ -306,21 +370,34 @@ pub fn check_timeout_upstream(upstream: *Upstream, timer: *EvLoop.Timer) void {
     const session_id = upstream.session_id;
     if (session_id == 0)
         return;
-    const meta = _session_table.get(session_id) orelse {
+    const slot = get_session_slot(session_id) orelse {
         upstream.session_id = 0;
         return;
     };
-    if (meta.upstream != upstream) {
-        log.err(@src(), "timeout session mismatch, reset: %u", .{cc.to_uint(session_id)});
+    const handle = get_session_ptr_handle(slot.ptr.?) orelse {
+        log.err(@src(), "timeout session ptr missing, reset: %llu", .{cc.to_ulonglong(session_id)});
+        unregister_session_ptr(slot.ptr.?);
+        release_session_slot(session_id);
+        upstream.session_id = 0;
+        return;
+    };
+    if (handle != session_id) {
+        log.err(@src(), "timeout session ptr mismatch, reset: %llu", .{cc.to_ulonglong(session_id)});
+        release_session_slot(session_id);
         upstream.session_id = 0;
         return;
     }
-    switch (meta.kind) {
+    if (slot.upstream == null or slot.upstream.? != upstream) {
+        log.err(@src(), "timeout session mismatch, reset: %llu", .{cc.to_ulonglong(session_id)});
+        upstream.session_id = 0;
+        return;
+    }
+    switch (slot.kind) {
         .udp => {
-            const session = cc.ptrcast(*UDP, meta.ptr);
-            if (!is_session_ptr_known(meta.ptr) or !session.session_node.is_alive() or session.session_node.id != session_id) {
-                log.err(@src(), "timeout session stale, reset: %u", .{cc.to_uint(session_id)});
-                unregister_session(session_id);
+            const session = cc.ptrcast(*UDP, slot.ptr.?);
+            if (!session.session_node.is_alive() or session.session_node.id != session_id) {
+                log.err(@src(), "timeout session stale, reset: %llu", .{cc.to_ulonglong(session_id)});
+                release_session_slot(session_id);
                 upstream.session_id = 0;
                 return;
             }
@@ -330,10 +407,10 @@ pub fn check_timeout_upstream(upstream: *Upstream, timer: *EvLoop.Timer) void {
                 session.free();
         },
         .tcp => {
-            const session = cc.ptrcast(*TCP, meta.ptr);
-            if (!is_session_ptr_known(meta.ptr) or !session.session_node.is_alive() or session.session_node.id != session_id) {
-                log.err(@src(), "timeout session stale, reset: %u", .{cc.to_uint(session_id)});
-                unregister_session(session_id);
+            const session = cc.ptrcast(*TCP, slot.ptr.?);
+            if (!session.session_node.is_alive() or session.session_node.id != session_id) {
+                log.err(@src(), "timeout session stale, reset: %llu", .{cc.to_ulonglong(session_id)});
+                release_session_slot(session_id);
                 upstream.session_id = 0;
                 return;
             }
@@ -351,7 +428,7 @@ const SessionNode = struct {
     node: Node = undefined, // legacy list node (unused)
     linked: bool = false,
     magic: u32 = session_magic_alive,
-    id: u32 = 0,
+    id: SessionHandle = 0,
 
     pub fn from(node: *Node) *SessionNode {
         return @fieldParentPtr(SessionNode, "node", node);
@@ -394,7 +471,6 @@ const SessionNode = struct {
 /// udp session
 const UDP = struct {
     session_node: SessionNode = .{ .type = .udp }, // _session_list node
-    free_next: ?*UDP = null,
     upstream: *Upstream,
     fdobj: *EvLoop.Fd,
     proxy_fdobj: ?*EvLoop.Fd = null, // socks5 tcp control channel (UDP ASSOCIATE)
@@ -420,23 +496,10 @@ const UDP = struct {
     proxy_prefix_len: u8 = 0,
 
     pub fn new(upstream: *Upstream) ?*UDP {
-        var reused = false;
-        const self = if (_free_udp) |node| b: {
-            _free_udp = node.free_next;
-            reused = true;
-            break :b node;
-        } else g.allocator.create(UDP) catch unreachable;
+        const self = g.allocator.create(UDP) catch unreachable;
         self.* = .{ .upstream = upstream, .fdobj = undefined, .create_time = g.evloop.time };
-
-        errdefer {
-            if (reused) {
-                self.session_node.mark_freed();
-                self.free_next = _free_udp;
-                _free_udp = self;
-            } else {
-                g.allocator.destroy(self);
-            }
-        }
+        var ok = false;
+        defer if (!ok) g.allocator.destroy(self);
 
         self.proxy_enabled = use_proxy(upstream);
 
@@ -448,7 +511,7 @@ const UDP = struct {
         const fd = net.new_sock(family, .udp) orelse return null;
         self.fdobj = EvLoop.Fd.new(fd);
 
-        register_session_ptr(self);
+        ok = true;
         return self;
     }
 
@@ -456,7 +519,7 @@ const UDP = struct {
     /// - reply_receiver
     /// - check_timeout
     fn free(self: *UDP) void {
-        if (!is_session_ptr_known(@ptrCast(*anyopaque, self)))
+        const handle = get_session_ptr_handle(@ptrCast(*anyopaque, self)) orelse
             return;
         if (!self.session_node.is_alive())
             return;
@@ -466,7 +529,11 @@ const UDP = struct {
             return;
         }
         self.freeing = true;
-        defer self.freeing = false;
+        var free_guard = true;
+        defer {
+            if (free_guard)
+                self.freeing = false;
+        }
         if (self.active > 0) {
             self.closing = true;
             if (self.upstream.session_eql(self.session_node.id))
@@ -522,10 +589,12 @@ const UDP = struct {
         self.stale_buf.clearAndFree(g.allocator);
         self.query_list.clearAndFree(g.allocator);
         self.session_node.mark_freed();
-        unregister_session(self.session_node.id);
+        release_session_slot(handle);
         self.session_node.id = 0;
-        self.free_next = _free_udp;
-        _free_udp = self;
+        unregister_session_ptr(self);
+        self.freeing = false;
+        free_guard = false;
+        g.allocator.destroy(self);
     }
 
     pub fn get_deadline(self: *const UDP) u64 {
@@ -535,7 +604,7 @@ const UDP = struct {
 
     /// [nosuspend]
     pub fn send_query(self: *UDP, qmsg: *RcMsg) bool {
-        if (!is_session_ptr_known(@ptrCast(*anyopaque, self)) or !self.session_node.is_alive())
+        if (get_session_ptr_handle(@ptrCast(*anyopaque, self)) == null or !self.session_node.is_alive())
             return false;
         const limit = pending_limit();
         if (self.query_list.count() >= limit) {
@@ -974,7 +1043,6 @@ pub const TLS = struct {
 /// tcp/tls session
 const TCP = struct {
     session_node: SessionNode = .{ .type = .tcp }, // _session_list node
-    free_next: ?*TCP = null,
     upstream: *Upstream,
     fdobj: ?*EvLoop.Fd = null, // tcp connection
     tls: TLS_ = .{}, // tls connection (DoT)
@@ -1107,23 +1175,16 @@ const TCP = struct {
     };
 
     pub fn new(upstream: *Upstream) *TCP {
-        var reused = false;
-        const self = if (_free_tcp) |node| b: {
-            _free_tcp = node.free_next;
-            reused = true;
-            break :b node;
-        } else g.allocator.create(TCP) catch unreachable;
+        const self = g.allocator.create(TCP) catch unreachable;
         self.* = .{
             .upstream = upstream,
             .create_time = g.evloop.time,
         };
-        if (!reused)
-            register_session_ptr(self);
         return self;
     }
 
     pub fn free(self: *TCP) void {
-        if (!is_session_ptr_known(@ptrCast(*anyopaque, self)))
+        const handle = get_session_ptr_handle(@ptrCast(*anyopaque, self)) orelse
             return;
         if (!self.session_node.is_alive())
             return;
@@ -1133,7 +1194,11 @@ const TCP = struct {
             return;
         }
         self.flags.freeing = true;
-        defer self.flags.freeing = false;
+        var free_guard = true;
+        defer {
+            if (free_guard)
+                self.flags.freeing = false;
+        }
         if (self.active > 0) {
             self.flags.closing = true;
             if (self.upstream.session_eql(self.session_node.id))
@@ -1176,10 +1241,12 @@ const TCP = struct {
         self.ack_list.clearAndFree(g.allocator);
         self.stale_buf.clearAndFree(g.allocator);
         self.session_node.mark_freed();
-        unregister_session(self.session_node.id);
+        release_session_slot(handle);
         self.session_node.id = 0;
-        self.free_next = _free_tcp;
-        _free_tcp = self;
+        unregister_session_ptr(self);
+        self.flags.freeing = false;
+        free_guard = false;
+        g.allocator.destroy(self);
     }
 
     pub fn get_deadline(self: *const TCP) u64 {
@@ -1210,7 +1277,7 @@ const TCP = struct {
 
     /// add to send queue, `qmsg.ref++`
     pub fn send_query(self: *TCP, qmsg: *RcMsg) bool {
-        if (!is_session_ptr_known(@ptrCast(*anyopaque, self)) or !self.session_node.is_alive())
+        if (get_session_ptr_handle(@ptrCast(*anyopaque, self)) == null or !self.session_node.is_alive())
             return false;
         const proxied = use_proxy(self.upstream);
 
