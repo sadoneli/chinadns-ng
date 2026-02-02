@@ -7,7 +7,7 @@ const Step = std.build.Step;
 const LibExeObjStep = std.build.LibExeObjStep;
 const OptionsStep = std.build.OptionsStep;
 
-const chinadns_version = "2026.01.27";
+const chinadns_version = "2026.01.29";
 
 var _b: *Builder = undefined;
 
@@ -20,6 +20,7 @@ var _strip: bool = undefined;
 var _enable_wolfssl: bool = undefined;
 var _wolfssl_noasm: bool = undefined;
 var _enable_mimalloc: bool = undefined;
+var _enable_mem_report: bool = undefined;
 var _exe_name: []const u8 = undefined;
 
 // conditional compilation for zig source files
@@ -87,6 +88,7 @@ fn init(b: *Builder) void {
     option_wolfssl();
     option_wolfssl_noasm();
     option_mimalloc();
+    option_mem_report();
     option_name(); // must be at the end
 
     _dep_wolfssl.base_dir = with_target_desc(_dep_wolfssl.src_dir, .ReleaseFast); // dependency lib always ReleaseFast
@@ -100,6 +102,7 @@ fn init(b: *Builder) void {
     _build_opts.addOption(bool, "is_test", _test);
     _build_opts.addOption(bool, "enable_wolfssl", _enable_wolfssl);
     _build_opts.addOption(bool, "enable_mimalloc", _enable_mimalloc);
+    _build_opts.addOption(bool, "mem_report", _enable_mem_report);
     _build_opts.addOption([]const u8, "version", chinadns_version);
     _build_opts.addOption([]const u8, "commit_id", get_commit_id());
     _build_opts.addOption([]const u8, "wolfssl_version", _dep_wolfssl.version);
@@ -166,6 +169,10 @@ fn option_wolfssl_noasm() void {
 
 fn option_mimalloc() void {
     _enable_mimalloc = _b.option(bool, "mimalloc", "using the mimalloc allocator (libc), default: false") orelse false;
+}
+
+fn option_mem_report() void {
+    _enable_mem_report = _b.option(bool, "mem-report", "enable memory report feature, default: true") orelse true;
 }
 
 fn option_name() void {

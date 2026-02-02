@@ -242,11 +242,23 @@ const Query = struct {
         }
 
         fn shrink(self: *List) void {
+            const cnt = self.map.count();
+            if (cnt == 0) {
+                self.map.clearAndFree(g.allocator);
+                return;
+            }
+
             var new_map: @TypeOf(self.map) = .{};
+            new_map.ensureTotalCapacity(g.allocator, cnt) catch return;
+
             var it = self.map.iterator();
             while (it.next()) |entry| {
-                new_map.put(g.allocator, entry.key_ptr.*, entry.value_ptr.*) catch {};
+                new_map.put(g.allocator, entry.key_ptr.*, entry.value_ptr.*) catch {
+                    new_map.deinit(g.allocator);
+                    return;
+                };
             }
+
             self.map.deinit(g.allocator);
             self.map = new_map;
         }
@@ -288,6 +300,18 @@ var _tcp_conn_list: Node = undefined;
 var _tcp_conn_active: u32 = 0;
 var _tcp_conn_drop_counter: u32 = 0;
 var _tcp_conn_drop_last_ms: u64 = 0;
+
+pub fn pending_query_count() usize {
+    return _query_list.count();
+}
+
+pub fn pending_query_capacity() usize {
+    return _query_list.map.capacity();
+}
+
+pub fn tcp_conn_active() u32 {
+    return _tcp_conn_active;
+}
 
 // =======================================================================================================
 

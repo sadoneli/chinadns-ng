@@ -15,7 +15,9 @@ const EvLoop = @import("EvLoop.zig");
 const co = @import("co.zig");
 const groups = @import("groups.zig");
 const cache = @import("cache.zig");
+const Upstream = @import("Upstream.zig");
 const verdict_cache = @import("verdict_cache.zig");
+const str2int = @import("str2int.zig");
 const Tag = @import("tag.zig").Tag;
 const assert = std.debug.assert;
 
@@ -59,6 +61,108 @@ const _debug = builtin.mode == .Debug;
 
 const gpa_t = if (_debug) std.heap.GeneralPurposeAllocator(.{}) else void;
 var _gpa: gpa_t = undefined;
+
+const MemReport = struct {
+    rss: u32 = 0,
+    size: u32 = 0,
+    data: u32 = 0,
+    peak: u32 = 0,
+    hwm: u32 = 0,
+};
+
+var _next_mem_report_ms: u64 = 0;
+
+fn parse_kb(line: []const u8, prefix: []const u8) ?u32 {
+    if (!std.mem.startsWith(u8, line, prefix))
+        return null;
+
+    var i: usize = prefix.len;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    var j: usize = i;
+    while (j < line.len and line[j] >= '0' and line[j] <= '9') : (j += 1) {}
+    if (j == i)
+        return null;
+    return str2int.parse(u32, line[i..j], 10) orelse null;
+}
+
+fn read_mem_report() ?MemReport {
+    const fd = cc.open("/proc/self/status", c.O_RDONLY | c.O_CLOEXEC, null) orelse return null;
+    defer _ = cc.close(fd);
+
+    var buf: [2048]u8 = undefined;
+    const n = cc.read(fd, buf[0..]) orelse return null;
+    const data = buf[0..n];
+
+    var report: MemReport = .{};
+    var it = std.mem.split(u8, data, "\n");
+    while (it.next()) |line| {
+        if (parse_kb(line, "VmRSS:")) |v| report.rss = v
+        else if (parse_kb(line, "VmSize:")) |v| report.size = v
+        else if (parse_kb(line, "VmData:")) |v| report.data = v
+        else if (parse_kb(line, "VmPeak:")) |v| report.peak = v
+        else if (parse_kb(line, "VmHWM:")) |v| report.hwm = v;
+    }
+
+    if (report.rss == 0 and report.size == 0 and report.data == 0 and report.peak == 0 and report.hwm == 0)
+        return null;
+
+    return report;
+}
+
+pub fn check_timeout(timer: *EvLoop.Timer) void {
+    if (!build_opts.mem_report)
+        return;
+    if (g.mem_report_sec == 0)
+        return;
+
+    const now = g.evloop.time;
+    if (_next_mem_report_ms == 0)
+        _next_mem_report_ms = now + cc.to_u64(g.mem_report_sec) * 1000;
+
+    if (timer.check_deadline(_next_mem_report_ms)) {
+        _next_mem_report_ms = now + cc.to_u64(g.mem_report_sec) * 1000;
+        if (read_mem_report()) |r| {
+            const q_cnt = server.pending_query_count();
+            const q_cap = server.pending_query_capacity();
+            const tcp_n = server.tcp_conn_active();
+            const sess_cnt = Upstream.session_ptrs_count();
+            const sess_cap = Upstream.session_ptrs_capacity();
+            const sess_stats = Upstream.collect_session_stats();
+            const cache_cnt = cache.count();
+            const vcache_cnt = verdict_cache.count();
+
+            log.info(
+                @src(),
+                "mem: VmRSS:%u kB VmSize:%u kB VmData:%u kB VmPeak:%u kB VmHWM:%u kB objs: q=%zu/%zu conn_tcp=%u sp=%zu/%zu slot=%zu/%zu sess_udp=%zu sess_tcp=%zu udp_pend=%zu/%zu udp_proxy=%zu tcp_pend=%zu tcp_ack=%zu/%zu tcp_send=%zu cache=%zu vcache=%zu",
+                .{
+                    cc.to_uint(r.rss),
+                    cc.to_uint(r.size),
+                    cc.to_uint(r.data),
+                    cc.to_uint(r.peak),
+                    cc.to_uint(r.hwm),
+                    cc.to_usize(q_cnt),
+                    cc.to_usize(q_cap),
+                    cc.to_uint(tcp_n),
+                    cc.to_usize(sess_cnt),
+                    cc.to_usize(sess_cap),
+                    cc.to_usize(sess_stats.slots_total),
+                    cc.to_usize(sess_stats.slots_active),
+                    cc.to_usize(sess_stats.udp_sessions),
+                    cc.to_usize(sess_stats.tcp_sessions),
+                    cc.to_usize(sess_stats.udp_pending),
+                    cc.to_usize(sess_stats.udp_pending_cap),
+                    cc.to_usize(sess_stats.udp_proxy_pending),
+                    cc.to_usize(sess_stats.tcp_pending),
+                    cc.to_usize(sess_stats.tcp_ack),
+                    cc.to_usize(sess_stats.tcp_ack_cap),
+                    cc.to_usize(sess_stats.tcp_sendq),
+                    cc.to_usize(cache_cnt),
+                    cc.to_usize(vcache_cnt),
+                },
+            );
+        }
+    }
+}
 
 // ============================================================================
 
@@ -256,6 +360,9 @@ pub fn main() u8 {
 
     if (g.tcp_idle_sec > 0)
         log.info(src, "tcp client idle timeout: %us", .{cc.to_uint(g.tcp_idle_sec)});
+
+    if (build_opts.mem_report and g.mem_report_sec > 0)
+        log.info(src, "memory report interval: %us", .{cc.to_uint(g.mem_report_sec)});
 
     if (g.verbose())
         log.info(src, "printing the verbose runtime log", .{});

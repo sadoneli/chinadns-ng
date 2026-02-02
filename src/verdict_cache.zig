@@ -25,6 +25,10 @@ pub fn get(msg: []const u8, qnamelen: c_int) ?bool {
     return _map.get(qname);
 }
 
+pub fn count() usize {
+    return _map.count();
+}
+
 /// tag:none && has_china_path && has_trust_path
 pub fn add(msg: []const u8, qnamelen: c_int, is_china_domain: bool) void {
     if (g.verdict_cache_size == 0)
@@ -141,7 +145,7 @@ pub fn dump(event: enum { on_exit, on_manual }) void {
         .on_manual => "/tmp/chinadns@verdict-cache.db",
     };
 
-    var count: usize = 0;
+    var dump_count: usize = 0;
 
     const file = cc.fopen(path, "wb") orelse {
         log.warn(src, "fopen(%s) failed: (%d) %m", .{ path, cc.errno() });
@@ -149,7 +153,7 @@ pub fn dump(event: enum { on_exit, on_manual }) void {
     };
     defer {
         _ = cc.fclose(file);
-        log.info(src, "%zu entries to %s", .{ count, path });
+        log.info(src, "%zu entries to %s", .{ dump_count, path });
     }
 
     var it = _map.iterator();
@@ -174,6 +178,6 @@ pub fn dump(event: enum { on_exit, on_manual }) void {
         // is_china_domain(1/0) domain_name(ascii_format)
         cc.fprintf(file, "%u %s\n", .{ cc.to_uint(@boolToInt(is_china_domain)), &ascii });
 
-        count += 1;
+        dump_count += 1;
     }
 }

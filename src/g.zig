@@ -64,6 +64,9 @@ pub var tcp_conn_max: u32 = 256;
 /// tcp client idle timeout in seconds (0 = disable)
 pub var tcp_idle_sec: u32 = 60;
 
+/// periodic memory report interval in seconds (0 = disable)
+pub var mem_report_sec: u32 = 0;
+
 /// consecutive failures before marking an upstream temporarily down
 pub var upstream_fail_threshold: u8 = 3;
 

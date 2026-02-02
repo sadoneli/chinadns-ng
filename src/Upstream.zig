@@ -157,6 +157,69 @@ var _session_slots: std.ArrayListUnmanaged(SessionSlot) = .{};
 var _session_free: ?u32 = null;
 var _session_ptrs: std.AutoHashMapUnmanaged(usize, SessionHandle) = .{};
 
+pub const SessionStats = struct {
+    slots_total: usize = 0,
+    slots_active: usize = 0,
+    udp_sessions: usize = 0,
+    tcp_sessions: usize = 0,
+    udp_pending: usize = 0,
+    udp_proxy_pending: usize = 0,
+    tcp_pending: usize = 0,
+    tcp_ack: usize = 0,
+    tcp_sendq: usize = 0,
+    udp_pending_cap: usize = 0,
+    tcp_ack_cap: usize = 0,
+};
+
+pub fn session_ptrs_count() usize {
+    return _session_ptrs.count();
+}
+
+pub fn session_ptrs_capacity() usize {
+    return _session_ptrs.capacity();
+}
+
+pub fn collect_session_stats() SessionStats {
+    var stats: SessionStats = .{};
+    stats.slots_total = _session_slots.items.len;
+
+    for (_session_slots.items) |slot, idx| {
+        if (slot.ptr == null)
+            continue;
+
+        const handle = get_session_ptr_handle(slot.ptr.?) orelse continue;
+        const expected = make_session_handle(@intCast(u32, idx), slot.generation);
+        if (handle != expected)
+            continue;
+
+        stats.slots_active += 1;
+        switch (slot.kind) {
+            .udp => {
+                stats.udp_sessions += 1;
+                const udp = @ptrCast(*UDP, @alignCast(@alignOf(UDP), slot.ptr.?));
+                if (!udp.session_node.is_alive())
+                    continue;
+                stats.udp_pending += udp.query_list.count();
+                stats.udp_pending_cap += udp.query_list.capacity();
+                stats.udp_proxy_pending += udp.proxy_pending.items.len;
+            },
+            .tcp => {
+                stats.tcp_sessions += 1;
+                const tcp = @ptrCast(*TCP, @alignCast(@alignOf(TCP), slot.ptr.?));
+                if (!tcp.session_node.is_alive())
+                    continue;
+                const ack_cnt = tcp.ack_list.count();
+                stats.tcp_pending += tcp.pending_n;
+                stats.tcp_ack += ack_cnt;
+                stats.tcp_ack_cap += tcp.ack_list.capacity();
+                stats.tcp_sendq += if (tcp.pending_n >= ack_cnt) tcp.pending_n - ack_cnt else 0;
+            },
+        }
+    }
+
+    return stats;
+}
+
 pub fn module_init() void {
     _session_slots.deinit(g.allocator);
     _session_slots = .{};
@@ -171,13 +234,86 @@ pub fn shrink_memory() void {
     const cap = _session_ptrs.capacity();
     const cnt = _session_ptrs.count();
     if (cap > 64 and cnt * 4 < cap) {
+        if (cnt == 0) {
+            _session_ptrs.clearAndFree(g.allocator);
+            return;
+        }
+
         var new_ptrs: @TypeOf(_session_ptrs) = .{};
+        new_ptrs.ensureTotalCapacity(g.allocator, cnt) catch return;
+
         var it = _session_ptrs.iterator();
         while (it.next()) |entry| {
-            new_ptrs.put(g.allocator, entry.key_ptr.*, entry.value_ptr.*) catch {};
+            new_ptrs.put(g.allocator, entry.key_ptr.*, entry.value_ptr.*) catch {
+                new_ptrs.deinit(g.allocator);
+                return;
+            };
         }
         _session_ptrs.deinit(g.allocator);
         _session_ptrs = new_ptrs;
+    }
+}
+
+var _next_shrink_ms: u64 = 0;
+var _next_session_sweep_ms: u64 = 0;
+
+fn sweep_orphan_sessions(timer: *EvLoop.Timer, now: u64) void {
+    for (_session_slots.items) |slot, idx| {
+        if (slot.ptr == null)
+            continue;
+
+        const handle = get_session_ptr_handle(slot.ptr.?) orelse continue;
+        const expected = make_session_handle(@intCast(u32, idx), slot.generation);
+        if (handle != expected)
+            continue;
+
+        if (slot.upstream != null and slot.upstream.?.session_id == handle)
+            continue; // handled by per-upstream timeout checks
+
+        switch (slot.kind) {
+            .udp => {
+                const udp = @ptrCast(*UDP, @alignCast(@alignOf(UDP), slot.ptr.?));
+                if (!udp.session_node.is_alive())
+                    continue;
+                udp.cleanup_stale_queries(now);
+                if (udp.is_idle()) {
+                    if (udp.should_retire())
+                        udp.free();
+                } else if (timer.check_deadline(udp.get_deadline())) {
+                    udp.free();
+                }
+            },
+            .tcp => {
+                const tcp = @ptrCast(*TCP, @alignCast(@alignOf(TCP), slot.ptr.?));
+                if (!tcp.session_node.is_alive())
+                    continue;
+                tcp.cleanup_stale_queries(timer);
+                if (tcp.is_idle()) {
+                    if (tcp.should_retire())
+                        tcp.free();
+                } else if (timer.check_deadline(tcp.get_deadline())) {
+                    tcp.free();
+                }
+            },
+        }
+    }
+}
+
+pub fn check_timeout(timer: *EvLoop.Timer) void {
+    const now = g.evloop.time;
+    if (_next_shrink_ms == 0)
+        _next_shrink_ms = now + 10_000;
+    if (_next_session_sweep_ms == 0)
+        _next_session_sweep_ms = now + 5_000;
+
+    if (timer.check_deadline(_next_session_sweep_ms)) {
+        _next_session_sweep_ms = now + 5_000;
+        sweep_orphan_sessions(timer, now);
+    }
+
+    if (timer.check_deadline(_next_shrink_ms)) {
+        _next_shrink_ms = now + 10_000;
+        shrink_memory();
     }
 }
 
@@ -1179,6 +1315,7 @@ const TCP = struct {
         pub fn is_empty(self: *const MsgQueue) bool {
             return self.head == null;
         }
+
 
         /// clear && msg.unref()
         pub fn clear(self: *MsgQueue) void {

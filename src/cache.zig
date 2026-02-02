@@ -17,6 +17,12 @@ pub fn module_init() void {
     _list.init();
 }
 
+pub fn count() usize {
+    if (!enabled())
+        return 0;
+    return map._nitems;
+}
+
 const map = opaque {
     var _buckets: []?*CacheMsg = &.{};
     var _nitems: usize = 0;
@@ -241,7 +247,7 @@ pub fn dump(event: enum { on_exit, on_manual }) void {
         .on_manual => "/tmp/chinadns@cache.db",
     };
 
-    var count: usize = 0;
+    var dump_count: usize = 0;
 
     const file = cc.fopen(path, "wb") orelse {
         log.warn(src, "fopen(%s) failed: (%d) %m", .{ path, cc.errno() });
@@ -249,7 +255,7 @@ pub fn dump(event: enum { on_exit, on_manual }) void {
     };
     defer {
         _ = cc.fclose(file);
-        log.info(src, "%zu entries to %s", .{ count, path });
+        log.info(src, "%zu entries to %s", .{ dump_count, path });
     }
 
     var it = _list.iterator();
@@ -261,6 +267,6 @@ pub fn dump(event: enum { on_exit, on_manual }) void {
             continue;
 
         cache_msg.dump(file);
-        count += 1;
+        dump_count += 1;
     }
 }
